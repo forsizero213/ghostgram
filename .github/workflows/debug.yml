@@ -1,4 +1,4 @@
-name: Strip DeveloperCertificates from fake profiles
+name: Align fake profiles with fake cert
 
 on:
   workflow_dispatch:
@@ -16,37 +16,95 @@ jobs:
           submodules: 'recursive'
           fetch-depth: '0'
 
-      - name: Fix all profiles
+      - name: Inspect certs and profiles
         run: |
           set -euo pipefail
+          echo "=== certs dir ==="
+          ls -la build-system/fake-codesigning/certs/
+
+          echo
+          echo "=== try extracting cert from p12 (empty password) ==="
+          openssl pkcs12 -in build-system/fake-codesigning/certs/SelfSigned.p12 \
+            -nokeys -clcerts -passin pass: 2>&1 | head -5 || true
+
+          echo
+          echo "=== try extracting cert from p12 (password=password) ==="
+          openssl pkcs12 -in build-system/fake-codesigning/certs/SelfSigned.p12 \
+            -nokeys -clcerts -passin pass:password 2>&1 | head -5 || true
+
+          echo
+          echo "=== Public.cer info ==="
+          openssl x509 -in build-system/fake-codesigning/certs/Public.cer \
+            -inform DER -noout -subject -issuer 2>&1 || \
+          openssl x509 -in build-system/fake-codesigning/certs/Public.cer \
+            -noout -subject -issuer 2>&1 || true
+
+          echo
+          echo "=== ImportCertificates.py password hint ==="
+          grep -in "password\|passin\|p12\|SelfSigned" \
+            build-system/Make/ImportCertificates.py | head -20 || true
+
+      - name: Inject fake cert into every profile
+        run: |
+          set -euo pipefail
+
           PROF_DIR="build-system/fake-codesigning/profiles"
+          CERT_P12="build-system/fake-codesigning/certs/SelfSigned.p12"
           WORK="$(mktemp -d)"
           trap 'rm -rf "$WORK"' EXIT
 
+          # Extract the leaf certificate from the p12 as DER. Try empty
+          # password first (Telegram's default), then "password".
+          if openssl pkcs12 -in "$CERT_P12" -nokeys -clcerts -passin pass: \
+               -outform DER -out "$WORK/cert.der" 2>/dev/null; then
+            echo "Extracted with empty password."
+          elif openssl pkcs12 -in "$CERT_P12" -nokeys -clcerts -passin pass:password \
+                 -outform DER -out "$WORK/cert.der" 2>/dev/null; then
+            echo "Extracted with password='password'."
+          else
+            echo "::error::Cannot extract cert from p12."
+            exit 1
+          fi
+
+          echo "Cert DER size: $(stat -f%z "$WORK/cert.der") bytes"
+          openssl x509 -inform DER -in "$WORK/cert.der" -noout -subject || true
+
+          # Self-signed cert used only to wrap the plist as CMS (this is
+          # separate from the DeveloperCertificates we inject).
           openssl req -x509 -newkey rsa:2048 -nodes \
-            -keyout "$WORK/key.pem" -out "$WORK/cert.pem" \
+            -keyout "$WORK/key.pem" -out "$WORK/signer.pem" \
             -days 3650 -subj "/CN=Fake Provisioning" 2>/dev/null
 
           for f in "$PROF_DIR"/*.mobileprovision; do
             echo "=== $f"
             security cms -D -i "$f" > "$WORK/payload.plist"
 
-            python3 - "$WORK/payload.plist" <<'PY'
+            python3 - "$WORK/payload.plist" "$WORK/cert.der" <<'PY'
           import plistlib, sys
-          p = plistlib.load(open(sys.argv[1], "rb"))
-          p.pop("DeveloperCertificates", None)
-          plistlib.dump(p, open(sys.argv[1], "wb"))
+          plist_path, der_path = sys.argv[1], sys.argv[2]
+          p = plistlib.load(open(plist_path, "rb"))
+          p["DeveloperCertificates"] = [open(der_path, "rb").read()]
+          plistlib.dump(p, open(plist_path, "wb"))
+          print("  injected cert, expiry =", p.get("ExpirationDate"))
           PY
 
             openssl smime -sign \
-              -signer "$WORK/cert.pem" \
+              -signer "$WORK/signer.pem" \
               -inkey  "$WORK/key.pem" \
-              -certfile "$WORK/cert.pem" \
+              -certfile "$WORK/signer.pem" \
               -in "$WORK/payload.plist" \
               -outform der -nodetach \
               -out "$WORK/new.prof"
 
             openssl smime -verify -noverify -inform der -in "$WORK/new.prof" >/dev/null
+
+            # Verify the DeveloperCertificates key survived the round trip.
+            DECODED="$(security cms -D -i "$WORK/new.prof")"
+            echo "$DECODED" | grep -q "DeveloperCertificates" \
+              || { echo "::error::DeveloperCertificates missing after re-sign"; exit 1; }
+            echo "$DECODED" | grep -A1 "<key>ExpirationDate</key>" | grep "<date>" \
+              || { echo "::error::ExpirationDate missing after re-sign"; exit 1; }
+
             mv "$WORK/new.prof" "$f"
           done
 
@@ -56,5 +114,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add build-system/fake-codesigning/profiles/
-          git commit -m "Strip DeveloperCertificates from fake provisioning profiles"
+          git commit -m "Inject fake cert into DeveloperCertificates of all provisioning profiles"
           git push
