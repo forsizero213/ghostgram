@@ -25,17 +25,13 @@ jobs:
       - name: Set active Xcode path
         run: |
           set -euo pipefail
-
           XCODE_VERSION=$(python3 -c '
           import json
           with open("versions.json") as f:
               print(json.load(f)["xcode"])
           ')
-
           echo "Using Xcode $XCODE_VERSION"
-
           sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
-
           xcodebuild -version
 
       - name: Cache Bazel Build Directory
@@ -55,19 +51,14 @@ jobs:
       - name: Create canonical source directory
         run: |
           set -euo pipefail
-
           sudo mkdir -p /Users/Shared
-
           rm -rf /Users/Shared/telegram-ios
-
           cp -R "$GITHUB_WORKSPACE" /Users/Shared/telegram-ios
 
       - name: Setup Minimal Configuration
         run: |
           set -euo pipefail
-
           cd /Users/Shared/telegram-ios
-
           cat << 'EOF' > build-system/appstore-configuration.json
           {
             "bundle_id": "ph.telegra.Telegraph",
@@ -85,30 +76,49 @@ jobs:
           }
           EOF
 
-      - name: Skip provisioning-profile expiry validation
+      - name: Fix expired BroadcastUpload provisioning profile
         run: |
           set -euo pipefail
 
           cd /Users/Shared/telegram-ios
 
-          # rules_apple validates the ExpirationDate on every provisioning
-          # profile it touches. The fake profiles that ship with this repo
-          # have a hardcoded past date, which kills the build at the
-          # ProcessEntitlementsFiles step. Tell rules_apple to skip that
-          # check — we strip all signing data later anyway.
-          #
-          # The define name is read by rules_apple's
-          # `provisioning_profile_expiration_check` config_setting.
-          # If a future rules_apple version renames it, the build will
-          # fail the same way and you'll need to update this line.
-          {
-            echo ''
-            echo '# Added by CI: skip provisioning-profile expiry validation'
-            echo 'build --define=apple.provisioning_profile_expiration_check=skip'
-          } >> .bazelrc
+          # Restore from git in case a previous run corrupted it.
+          git checkout HEAD -- build-system/fake-codesigning/profiles/BroadcastUpload.mobileprovision
 
-          echo '--- .bazelrc tail ---'
-          tail -n 5 .bazelrc
+          PROF="build-system/fake-codesigning/profiles/BroadcastUpload.mobileprovision"
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$WORK"' EXIT
+
+          # Self-signed cert/key just to wrap the plist as CMS.
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$WORK/key.pem" -out "$WORK/cert.pem" \
+            -days 3650 -subj "/CN=Fake Provisioning" 2>/dev/null
+
+          # Decode existing CMS blob into a plist.
+          security cms -D -i "$PROF" > "$WORK/payload.plist"
+
+          # Bump expiry far into the future.
+          FUTURE_DATE="2035-12-31T23:59:59Z"
+          /usr/libexec/PlistBuddy -c "Set :ExpirationDate $FUTURE_DATE" "$WORK/payload.plist" \
+            || /usr/libexec/PlistBuddy -c "Add :ExpirationDate date $FUTURE_DATE" "$WORK/payload.plist"
+
+          # Re-wrap as DER CMS. No fallback — if this fails, set -e aborts
+          # and the original file is never touched.
+          openssl smime -sign \
+            -signer "$WORK/cert.pem" \
+            -inkey  "$WORK/key.pem" \
+            -certfile "$WORK/cert.pem" \
+            -in "$WORK/payload.plist" \
+            -outform der -nodetach \
+            -out "$WORK/new.prof"
+
+          # Verify the new blob parses cleanly before replacing the original.
+          openssl smime -verify -noverify -inform der -in "$WORK/new.prof" >/dev/null
+
+          mv "$WORK/new.prof" "$PROF"
+
+          echo "Patched: $PROF"
+          security cms -D -i "$PROF" | grep -A1 ExpirationDate
 
       - name: Pre-download Bazel Binary with Retry
         run: |
@@ -116,26 +126,19 @@ jobs:
           BAZEL_VERSION="8.4.2"
           BAZEL_DIR="/tmp/bazel-bin-cache"
           mkdir -p "$BAZEL_DIR"
-
           if [ ! -f "$BAZEL_DIR/bazel" ]; then
             echo "Downloading Bazel $BAZEL_VERSION..."
-            curl --retry 10 \
-                 --retry-delay 5 \
-                 --retry-max-time 120 \
-                 --connect-timeout 15 \
-                 -sSL "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-darwin-arm64" \
-                 -o "$BAZEL_DIR/bazel"
+            curl --retry 10 --retry-delay 5 --retry-max-time 120 --connect-timeout 15 \
+              -sSL "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-darwin-arm64" \
+              -o "$BAZEL_DIR/bazel"
             chmod +x "$BAZEL_DIR/bazel"
           fi
-
           echo "BAZEL_BIN=$BAZEL_DIR/bazel" >> "$GITHUB_ENV"
 
       - name: Prepare unsigned build
         run: |
           set -euo pipefail
-
           cd /Users/Shared/telegram-ios
-
           rm -rf build-input
 
           BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
@@ -151,30 +154,23 @@ jobs:
 
           echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
           echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
-
           echo "APP_VERSION=$APP_VERSION"
           echo "BUILD_NUMBER=$BUILD_NUMBER"
 
       - name: Verify fake codesigning data
         run: |
           set -euo pipefail
-
           cd /Users/Shared/telegram-ios
-
           if [ ! -d "build-system/fake-codesigning" ]; then
-            echo "ERROR: build-system/fake-codesigning not found in this checkout."
+            echo "ERROR: build-system/fake-codesigning not found."
             exit 1
           fi
-
-          echo "Found build-system/fake-codesigning:"
           ls -la build-system/fake-codesigning
 
       - name: Import fake certificates
         run: |
           set -euo pipefail
-
           cd /Users/Shared/telegram-ios
-
           python3 build-system/Make/ImportCertificates.py \
             --path build-system/fake-codesigning/certs
 
@@ -197,19 +193,14 @@ jobs:
             --buildNumber="$BUILD_NUMBER"
 
           OUTPUT_PATH="build/artifacts"
-
           rm -rf "$OUTPUT_PATH"
           mkdir -p "$OUTPUT_PATH"
 
           IPA_PATH=""
-
           if [ -f "bazel-bin/Telegram/Telegram.ipa" ]; then
             IPA_PATH="bazel-bin/Telegram/Telegram.ipa"
           else
-            IPA_PATH=$(find bazel-out \
-              -path '*/bin/Telegram/Telegram.ipa' \
-              -type f \
-              -print -quit || true)
+            IPA_PATH=$(find bazel-out -path '*/bin/Telegram/Telegram.ipa' -type f -print -quit || true)
           fi
 
           if [ -z "$IPA_PATH" ] || [ ! -f "$IPA_PATH" ]; then
@@ -218,113 +209,60 @@ jobs:
           fi
 
           echo "Found IPA: $IPA_PATH"
-
           cp "$IPA_PATH" "$OUTPUT_PATH/Telegram.ipa"
-
-          echo "IPA:"
           ls -lh "$OUTPUT_PATH/Telegram.ipa"
 
       - name: Strip signing and provisioning data
         run: |
           set -euo pipefail
-
           cd /Users/Shared/telegram-ios
 
           IPA="$PWD/build/artifacts/Telegram.ipa"
           TEMP_DIR="$(mktemp -d)"
           OUTPUT_DIR="$PWD/build/artifacts"
-
           trap 'rm -rf "$TEMP_DIR"' EXIT
 
-          echo "Extracting IPA..."
           unzip -q "$IPA" -d "$TEMP_DIR"
 
-          echo "Removing provisioning profiles..."
-
-          find "$TEMP_DIR/Payload" \
-            -type f \
-            -name "embedded.mobileprovision" \
-            -delete
-
-          echo "Removing code signatures..."
-
-          find "$TEMP_DIR/Payload" \
-            -type d \
-            -name "_CodeSignature" \
-            -prune \
-            -exec rm -rf {} +
-
-          find "$TEMP_DIR/Payload" \
-            -type f \
-            -name "CodeResources" \
-            -delete
+          find "$TEMP_DIR/Payload" -type f -name "embedded.mobileprovision" -delete
+          find "$TEMP_DIR/Payload" -type d -name "_CodeSignature" -prune -exec rm -rf {} +
+          find "$TEMP_DIR/Payload" -type f -name "CodeResources" -delete
 
           rm -f "$IPA"
-
           cd "$TEMP_DIR"
+          zip -qry "$OUTPUT_DIR/Telegram.ipa" Payload
 
-          zip -qry \
-            "$OUTPUT_DIR/Telegram.ipa" \
-            Payload
-
-          echo
           echo "Final unsigned IPA:"
           ls -lh "$OUTPUT_DIR/Telegram.ipa"
 
-          echo
-          echo "Checking for provisioning profiles..."
-
-          if unzip -l "$OUTPUT_DIR/Telegram.ipa" \
-              | grep -q "embedded.mobileprovision"; then
-            echo "::error::embedded.mobileprovision is still present!"
+          if unzip -l "$OUTPUT_DIR/Telegram.ipa" | grep -q "embedded.mobileprovision"; then
+            echo "::error::embedded.mobileprovision still present!"
             exit 1
           fi
-
-          echo "No provisioning profiles found."
-
-          echo
-          echo "Checking for code signatures..."
-
-          if unzip -l "$OUTPUT_DIR/Telegram.ipa" \
-              | grep -q "_CodeSignature/"; then
-            echo "::error::_CodeSignature is still present!"
+          if unzip -l "$OUTPUT_DIR/Telegram.ipa" | grep -q "_CodeSignature/"; then
+            echo "::error::_CodeSignature still present!"
             exit 1
           fi
-
-          echo "No _CodeSignature directories found."
-          echo
           echo "IPA is ready for KSign."
 
       - name: Collect DSYMs
         run: |
           set -euo pipefail
-
           cd /Users/Shared/telegram-ios
-
           OUTPUT_PATH="build/artifacts"
           mkdir -p build/DSYMs
 
           if [ -d "bazel-bin/Telegram/Telegram.app.dSYM" ]; then
-            cp -R bazel-bin/Telegram/*.dSYM \
-              build/DSYMs/ 2>/dev/null || true
+            cp -R bazel-bin/Telegram/*.dSYM build/DSYMs/ 2>/dev/null || true
           else
-            find bazel-out \
-              -path '*/bin/Telegram/*.dSYM' \
-              -type d \
+            find bazel-out -path '*/bin/Telegram/*.dSYM' -type d \
               -exec cp -R {} build/DSYMs/ \; 2>/dev/null || true
           fi
 
           rm -f "$OUTPUT_PATH/Telegram.DSYMs.zip"
-
           cd build
-
-          zip -qr \
-            "../$OUTPUT_PATH/Telegram.DSYMs.zip" \
-            DSYMs
-
+          zip -qr "../$OUTPUT_PATH/Telegram.DSYMs.zip" DSYMs
           cd ..
-
-          echo "DSYM archive:"
           ls -lh "$OUTPUT_PATH/Telegram.DSYMs.zip"
 
       - name: Upload IPA and DSYMs as workflow artifacts
