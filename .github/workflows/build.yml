@@ -124,7 +124,37 @@ jobs:
 
           echo "APP_VERSION=$APP_VERSION"
           echo "BUILD_NUMBER=$BUILD_NUMBER"
+      - name: Create dummy provisioning profiles
+        run: |
+          set -euo pipefail
 
+          SOURCE_DIR=/Users/Shared/telegram-ios
+          PROVISIONING_DIR="$SOURCE_DIR/build-system/fake-provisioning"
+
+          mkdir -p "$PROVISIONING_DIR"
+
+          # Touch dummy files expected by Telegram target analysis
+          touch "$PROVISIONING_DIR/Telegram.mobileprovision"
+          touch "$PROVISIONING_DIR/Share.mobileprovision"
+          touch "$PROVISIONING_DIR/NotificationService.mobileprovision"
+          touch "$PROVISIONING_DIR/NotificationContent.mobileprovision"
+          touch "$PROVISIONING_DIR/Intents.mobileprovision"
+          touch "$PROVISIONING_DIR/Widget.mobileprovision"
+          touch "$PROVISIONING_DIR/WatchApp.mobileprovision"
+          touch "$PROVISIONING_DIR/WatchExtension.mobileprovision"
+
+          # Point appstore-configuration to the fake profiles directory if needed
+          python3 -c '
+          import json, os
+
+          config_path = "/Users/Shared/telegram-ios/build-system/appstore-configuration.json"
+          if os.path.exists(config_path):
+              with open(config_path, "r") as f:
+                  data = json.load(f)
+              data["provisioning_profiles_path"] = "build-system/fake-provisioning"
+              with open(config_path, "w") as f:
+                  json.dump(data, f, indent=2)
+          '
       - name: Build unsigned IPA
         run: |
           set -euo pipefail
