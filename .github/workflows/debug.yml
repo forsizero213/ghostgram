@@ -1,7 +1,23 @@
+name: Debug rules_apple provisioning check
+
+on:
+  workflow_dispatch:
+    inputs:
+      bazel_version:
+        description: 'Bazel version to use'
+        required: false
+        default: '8.4.2'
+
+permissions:
+  contents: read
+
+jobs:
   diagnose:
     runs-on: macos-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           submodules: 'recursive'
           fetch-depth: '0'
@@ -14,56 +30,189 @@
           with open("versions.json") as f:
               print(json.load(f)["xcode"])
           ')
+          echo "Using Xcode $XCODE_VERSION"
           sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
           xcodebuild -version
 
       - name: Download Bazel
         run: |
           set -euo pipefail
-          mkdir -p /tmp/bazel-bin-cache
-          curl --retry 10 --retry-delay 5 -sSL \
-            "https://github.com/bazelbuild/bazel/releases/download/8.4.2/bazel-8.4.2-darwin-arm64" \
-            -o /tmp/bazel-bin-cache/bazel
-          chmod +x /tmp/bazel-bin-cache/bazel
-          echo "BAZEL_BIN=/tmp/bazel-bin-cache/bazel" >> "$GITHUB_ENV"
+          BAZEL_VERSION="${{ github.event.inputs.bazel_version }}"
+          BAZEL_DIR="/tmp/bazel-bin-cache"
+          mkdir -p "$BAZEL_DIR"
+
+          if [ ! -f "$BAZEL_DIR/bazel" ]; then
+            curl --retry 10 --retry-delay 5 --retry-max-time 120 --connect-timeout 15 \
+              -sSL "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-darwin-arm64" \
+              -o "$BAZEL_DIR/bazel"
+            chmod +x "$BAZEL_DIR/bazel"
+          fi
+
+          echo "BAZEL_BIN=$BAZEL_DIR/bazel" >> "$GITHUB_ENV"
+          "$BAZEL_DIR/bazel" --version
+
+      - name: Dump environment info
+        run: |
+          set -euo pipefail
+          echo "=== uname ==="
+          uname -a
+          echo
+          echo "=== python ==="
+          python3 --version
+          echo
+          echo "=== openssl ==="
+          openssl version
+          echo
+          echo "=== .bazelrc (repo root) ==="
+          cat .bazelrc 2>/dev/null || echo "(no .bazelrc at repo root)"
+          echo
+          echo "=== any other .bazelrc files ==="
+          find . -maxdepth 3 -name '.bazelrc*' -not -path './.git/*' 2>/dev/null || true
+          echo
+          echo "=== versions.json ==="
+          cat versions.json 2>/dev/null || echo "(no versions.json)"
+          echo
+          echo "=== .bazelversion ==="
+          cat .bazelversion 2>/dev/null || echo "(no .bazelversion)"
+
+      - name: Dump fake-codesigning tree
+        run: |
+          set -euo pipefail
+          echo "=== build-system/fake-codesigning ==="
+          find build-system/fake-codesigning -type f -exec ls -la {} + 2>/dev/null || true
+          echo
+          echo "=== each .mobileprovision: type + decoded expiry ==="
+          find build-system/fake-codesigning -name '*.mobileprovision' -type f | while read -r f; do
+            echo "--- $f"
+            file "$f" || true
+            echo "first 16 bytes:"
+            head -c 16 "$f" | xxd || true
+            echo "decoded plist (ExpirationDate/CreationDate/Name):"
+            security cms -D -i "$f" 2>/dev/null \
+              | grep -A1 -E "ExpirationDate|CreationDate|<key>Name</key>" || echo "  (cannot decode)"
+          done
 
       - name: Fetch external repos
         run: |
           set -euo pipefail
           "$BAZEL_BIN" \
             --output_user_root=/private/var/tmp/_bazel_containerhost \
-            fetch //Telegram:Telegram || true
+            fetch //Telegram:Telegram 2>&1 | tail -n 200 || true
 
-      - name: Find the define name rules_apple uses
+      - name: Locate rules_apple
+        id: locate
         run: |
           set -euo pipefail
-
           ROOT=/private/var/tmp/_bazel_containerhost
-          echo "=== output_user_root contents ==="
+
+          echo "=== output_user_root ==="
           ls -la "$ROOT" || true
 
-          RA_DIR=$(find "$ROOT" -maxdepth 3 -type d -name "rules_apple+" 2>/dev/null | head -1 || true)
-          echo "rules_apple+ dir: $RA_DIR"
-
+          RA_DIR=$(find "$ROOT" -maxdepth 4 -type d -name "rules_apple+*" 2>/dev/null | head -1 || true)
           if [ -z "$RA_DIR" ]; then
-            echo "Could not find rules_apple+; dumping what IS there:"
-            find "$ROOT" -maxdepth 3 -type d -name "*rules_apple*" 2>/dev/null | head
-            find "$ROOT" -maxdepth 3 -type d -name "external" 2>/dev/null | head
-            exit 0
+            RA_DIR=$(find "$ROOT" -maxdepth 4 -type d -name "*rules_apple*" 2>/dev/null | head -1 || true)
           fi
 
-          echo
-          echo "=== grep ExpirationDate ==="
-          grep -rn "ExpirationDate" "$RA_DIR" 2>/dev/null | head -50 || true
+          echo "rules_apple dir: $RA_DIR"
+          echo "ra_dir=$RA_DIR" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$RA_DIR" ]; then
+            echo "Could not find rules_apple. Dumping what IS present under external:"
+            find "$ROOT" -maxdepth 3 -type d -name 'external' -exec ls {} \; 2>/dev/null || true
+          fi
+
+      - name: Grep rules_apple for expiry logic
+        if: steps.locate.outputs.ra_dir != ''
+        run: |
+          set -euo pipefail
+          RA_DIR="${{ steps.locate.outputs.ra_dir }}"
+          echo "Scanning $RA_DIR"
 
           echo
-          echo "=== grep provisioning_profile_expiration ==="
+          echo "=== files mentioning ExpirationDate ==="
+          grep -rln "ExpirationDate" "$RA_DIR" 2>/dev/null || true
+
+          echo
+          echo "=== matches with context ==="
+          grep -rn -B3 -A8 "ExpirationDate" "$RA_DIR" 2>/dev/null | head -200 || true
+
+          echo
+          echo "=== anything mentioning provisioning_profile_expiration ==="
           grep -rn "provisioning_profile_expiration" "$RA_DIR" 2>/dev/null | head -50 || true
 
           echo
-          echo "=== grep apple.provisioning ==="
+          echo "=== anything mentioning apple.provisioning ==="
           grep -rn "apple\.provisioning" "$RA_DIR" 2>/dev/null | head -50 || true
 
           echo
-          echo "=== grep config_setting around expiration ==="
-          grep -rn -B2 -A6 "ExpirationDate" "$RA_DIR" 2>/dev/null | head -120 || true
+          echo "=== config_setting blocks referencing provisioning ==="
+          grep -rn -B2 -A6 "config_setting" "$RA_DIR" 2>/dev/null \
+            | grep -i -B2 -A6 "provision" | head -100 || true
+
+      - name: Find the exact source file that raises the error
+        if: steps.locate.outputs.ra_dir != ''
+        run: |
+          set -euo pipefail
+          RA_DIR="${{ steps.locate.outputs.ra_dir }}"
+
+          echo "=== searching for 'is in the past' ==="
+          grep -rn "is in the past" "$RA_DIR" 2>/dev/null || true
+
+          echo
+          echo "=== searching plisttool sources ==="
+          find "$RA_DIR" -path '*plisttool*' -name '*.py' -o -path '*plisttool*' -name '*.bzl' 2>/dev/null | head -50 || true
+
+          echo
+          echo "=== grep plisttool dir for ExpirationDate ==="
+          PT_DIR=$(find "$RA_DIR" -maxdepth 4 -type d -name plisttool 2>/dev/null | head -1 || true)
+          echo "plisttool dir: $PT_DIR"
+          if [ -n "$PT_DIR" ]; then
+            grep -rn "ExpirationDate" "$PT_DIR" 2>/dev/null | head -50 || true
+            echo
+            echo "=== files in plisttool ==="
+            ls -la "$PT_DIR"
+          fi
+
+      - name: Grep any select() gated on a --define near expiry
+        if: steps.locate.outputs.ra_dir != ''
+        run: |
+          set -euo pipefail
+          RA_DIR="${{ steps.locate.outputs.ra_dir }}"
+
+          echo "=== all --define strings referenced in rules_apple ==="
+          grep -rn -- "--define=" "$RA_DIR" 2>/dev/null | head -100 || true
+
+          echo
+          echo "=== all config_setting names containing 'provision' or 'profile' ==="
+          grep -rn -A5 "config_setting(" "$RA_DIR" 2>/dev/null \
+            | grep -i -B1 -A5 "provision\|profile" | head -100 || true
+
+      - name: Grep for skip / ignore / disable knobs
+        if: steps.locate.outputs.ra_dir != ''
+        run: |
+          set -euo pipefail
+          RA_DIR="${{ steps.locate.outputs.ra_dir }}"
+
+          echo "=== any env var / define / attribute mentioning skip, ignore, disable ==="
+          grep -rn -i "skip.*provision\|provision.*skip" "$RA_DIR" 2>/dev/null | head -50 || true
+          grep -rn -i "ignore.*provision\|provision.*ignore" "$RA_DIR" 2>/dev/null | head -50 || true
+          grep -rn -i "disable.*provision\|provision.*disable" "$RA_DIR" 2>/dev/null | head -50 || true
+
+      - name: Also scan any local patched rules_apple copy in the repo
+        run: |
+          set -euo pipefail
+          echo "=== repo-local patches to rules_apple? ==="
+          find . -path ./.git -prune -o -type d -name "rules_apple*" -print 2>/dev/null | head
+          find . -path ./.git -prune -o -type f -name "*.patch" -print 2>/dev/null | head -50
+          find . -path ./.git -prune -o -type f -name "MODULE.bazel" -print 2>/dev/null | head -20
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "Diagnostic complete."
+          echo "Paste the logs of these steps back:"
+          echo "  - 'Dump fake-codesigning tree'"
+          echo "  - 'Grep rules_apple for expiry logic'"
+          echo "  - 'Find the exact source file that raises the error'"
+          echo "  - 'Grep any select() gated on a --define near expiry'"
+          echo "  - 'Grep for skip / ignore / disable knobs'"
