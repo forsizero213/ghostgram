@@ -1,13 +1,13 @@
-name: Debug provisioning profiles
+name: Fix BroadcastUpload provisioning profile
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  debug:
+  fix:
     runs-on: macos-latest
 
     steps:
@@ -16,61 +16,55 @@ jobs:
           submodules: 'recursive'
           fetch-depth: '0'
 
-      - name: Check all provisioning profiles
-        run: |
-          set -euo pipefail
-          PROF_DIR="build-system/fake-codesigning/profiles"
-          echo "=== Directory listing ==="
-          ls -la "$PROF_DIR"
-          echo
-          echo "=== Each profile ==="
-          for f in "$PROF_DIR"/*.mobileprovision; do
-            echo "----------------------------------------"
-            echo "FILE: $f"
-            echo "size: $(stat -f%z "$f") bytes"
-            echo "type: $(file -b "$f")"
-            echo "first 16 bytes:"
-            head -c 16 "$f" | xxd
-            echo "decoded:"
-            security cms -D -i "$f" 2>&1 | grep -A1 -E "ExpirationDate|CreationDate|<key>Name</key>" || echo "  (cannot decode)"
-          done
-
-      - name: Check BroadcastUpload specifically
+      - name: Show current state
         run: |
           set -euo pipefail
           PROF="build-system/fake-codesigning/profiles/BroadcastUpload.mobileprovision"
-          echo "=== file ==="
+          echo "=== before ==="
           ls -la "$PROF"
-          file "$PROF"
-          echo
-          echo "=== full decoded plist ==="
-          security cms -D -i "$PROF" 2>&1
+          security cms -D -i "$PROF" | grep -A1 ExpirationDate
 
-      - name: Check git status of profiles
+      - name: Patch profile
         run: |
           set -euo pipefail
-          echo "=== git log for profiles dir ==="
-          git log --oneline -5 -- build-system/fake-codesigning/profiles/ || true
-          echo
-          echo "=== git status ==="
-          git status --porcelain build-system/fake-codesigning/ || true
-          echo
-          echo "=== last commit that touched BroadcastUpload ==="
-          git log -1 --format=fuller -- build-system/fake-codesigning/profiles/BroadcastUpload.mobileprovision || true
 
-      - name: Check current date
-        run: |
-          echo "UTC now: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          echo "epoch:   $(date -u +%s)"
+          PROF="build-system/fake-codesigning/profiles/BroadcastUpload.mobileprovision"
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$WORK"' EXIT
 
-      - name: Where Bazel reads the profile from
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$WORK/key.pem" -out "$WORK/cert.pem" \
+            -days 3650 -subj "/CN=Fake Provisioning"
+
+          security cms -D -i "$PROF" > "$WORK/payload.plist"
+
+          /usr/libexec/PlistBuddy -c "Set :ExpirationDate 2035-12-31T23:59:59Z" "$WORK/payload.plist"
+
+          openssl smime -sign \
+            -signer "$WORK/cert.pem" \
+            -inkey  "$WORK/key.pem" \
+            -certfile "$WORK/cert.pem" \
+            -in "$WORK/payload.plist" \
+            -outform der -nodetach \
+            -out "$WORK/new.prof"
+
+          openssl smime -verify -noverify -inform der -in "$WORK/new.prof" >/dev/null
+
+          mv "$WORK/new.prof" "$PROF"
+
+      - name: Show new state
         run: |
           set -euo pipefail
-          echo "=== Telegram/BUILD around line 1439 ==="
-          sed -n '1420,1460p' Telegram/BUILD || true
-          echo
-          echo "=== references to fake-codesigning in BUILD/bzl ==="
-          grep -rn "fake-codesigning" --include=BUILD --include=*.bzl . 2>/dev/null | head -50 || true
-          echo
-          echo "=== references to BroadcastUpload.mobileprovision ==="
-          grep -rn "BroadcastUpload.mobileprovision" --include=BUILD --include=*.bzl --include=*.py . 2>/dev/null | head -50 || true
+          PROF="build-system/fake-codesigning/profiles/BroadcastUpload.mobileprovision"
+          echo "=== after ==="
+          ls -la "$PROF"
+          security cms -D -i "$PROF" | grep -A1 ExpirationDate
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add build-system/fake-codesigning/profiles/BroadcastUpload.mobileprovision
+          git commit -m "Fix expired BroadcastUpload fake provisioning profile"
+          git push
