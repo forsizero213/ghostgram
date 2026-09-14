@@ -134,8 +134,7 @@ jobs:
 
           cd "$SOURCE_DIR"
 
-          # Generate the build configuration without loading
-          # the expired fake provisioning profiles.
+          # Added --xcodeManagedCodesigning to satisfy Make.py validation
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
             --bazel="$BAZEL_BIN" \
@@ -143,6 +142,7 @@ jobs:
             --configurationPath="build-system/appstore-configuration.json" \
             --configuration=release_arm64 \
             --buildNumber="$BUILD_NUMBER" \
+            --xcodeManagedCodesigning \
             --bazelArg=--//Telegram:disableProvisioningProfiles
 
           OUTPUT_PATH="build/artifacts"
