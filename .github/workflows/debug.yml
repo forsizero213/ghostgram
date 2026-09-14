@@ -16,9 +16,10 @@ jobs:
           submodules: 'recursive'
           fetch-depth: '0'
 
-      - name: Show current state
+      - name: Restore original file from git
         run: |
           set -euo pipefail
+          git checkout HEAD -- build-system/fake-codesigning/profiles/BroadcastUpload.mobileprovision 2>/dev/null || true
           PROF="build-system/fake-codesigning/profiles/BroadcastUpload.mobileprovision"
           echo "=== before ==="
           ls -la "$PROF"
@@ -32,14 +33,33 @@ jobs:
           WORK="$(mktemp -d)"
           trap 'rm -rf "$WORK"' EXIT
 
+          # Self-signed cert to wrap the plist as CMS.
           openssl req -x509 -newkey rsa:2048 -nodes \
             -keyout "$WORK/key.pem" -out "$WORK/cert.pem" \
-            -days 3650 -subj "/CN=Fake Provisioning"
+            -days 3650 -subj "/CN=Fake Provisioning" 2>/dev/null
 
+          # Decode original into a plain plist.
           security cms -D -i "$PROF" > "$WORK/payload.plist"
+          echo "Decoded plist size: $(stat -f%z "$WORK/payload.plist") bytes"
 
-          /usr/libexec/PlistBuddy -c "Set :ExpirationDate 2035-12-31T23:59:59Z" "$WORK/payload.plist"
+          # Use Python's plistlib to set the date — PlistBuddy is unreliable here.
+          python3 - "$WORK/payload.plist" <<'PY'
+          import plistlib, datetime, sys
+          path = sys.argv[1]
+          with open(path, "rb") as f:
+              p = plistlib.load(f)
+          print("OLD ExpirationDate:", p.get("ExpirationDate"))
+          p["ExpirationDate"] = datetime.datetime(2035, 12, 31, 23, 59, 59)
+          with open(path, "wb") as f:
+              plistlib.dump(p, f)
+          print("NEW ExpirationDate:", p["ExpirationDate"])
+          PY
 
+          # Sanity: decoded modified plist must show 2035.
+          echo "Modified plist expiry:"
+          plutil -p "$WORK/payload.plist" | grep -i ExpirationDate
+
+          # Re-sign as DER CMS.
           openssl smime -sign \
             -signer "$WORK/cert.pem" \
             -inkey  "$WORK/key.pem" \
@@ -48,9 +68,20 @@ jobs:
             -outform der -nodetach \
             -out "$WORK/new.prof"
 
+          # Verify new blob is valid CMS.
           openssl smime -verify -noverify -inform der -in "$WORK/new.prof" >/dev/null
 
+          # Verify it decodes and has the new expiry BEFORE replacing the original.
+          NEW_EXP="$(security cms -D -i "$WORK/new.prof" | grep -A1 '<key>ExpirationDate</key>' | grep '<date>' | sed -E 's/.*<date>(.*)<\/date>.*/\1/')"
+          echo "New blob expiry: $NEW_EXP"
+
+          if [ "$NEW_EXP" != "2035-12-31T23:59:59Z" ]; then
+            echo "::error::New blob still has wrong expiry: $NEW_EXP"
+            exit 1
+          fi
+
           mv "$WORK/new.prof" "$PROF"
+          echo "Replaced original."
 
       - name: Show new state
         run: |
