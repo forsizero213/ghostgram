@@ -42,8 +42,10 @@ jobs:
           set -euo pipefail
 
           mkdir -p /tmp/bazel-bin-cache
-          BAZEL_VERSION=$(cat versions.json | python3 -c 'import json,sys;print(json.load(sys.stdin)["bazel"])')
-          BAZEL_PATH="/tmp/bazel-bin-cache/bazel-${BAZEL_VERSION}-darwin-arm64"
+          RAW_BAZEL_FIELD=$(cat versions.json | python3 -c 'import json,sys;print(json.load(sys.stdin)["bazel"])')
+          BAZEL_VERSION="${RAW_BAZEL_FIELD%%:*}"   # strip off the ":sha256..." suffix
+          ASSET="bazel-${BAZEL_VERSION}-darwin-arm64"
+          BAZEL_PATH="/tmp/bazel-bin-cache/${ASSET}"
 
           if [ -x "$BAZEL_PATH" ] && "$BAZEL_PATH" --version >/dev/null 2>&1; then
             echo "Using cached Bazel $BAZEL_VERSION"
@@ -51,7 +53,22 @@ jobs:
             echo "Downloading Bazel $BAZEL_VERSION"
             curl -L --retry 5 --retry-all-errors --fail \
               -o "$BAZEL_PATH" \
-              "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-darwin-arm64"
+              "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/${ASSET}"
+
+            # Verify against Bazel's own published checksum for this asset,
+            # NOT the (incorrect, x86_64) hash recorded in versions.json.
+            curl -L --retry 5 --retry-all-errors --fail \
+              -o "${BAZEL_PATH}.sha256" \
+              "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/${ASSET}.sha256"
+
+            EXPECTED=$(awk '{print $1}' "${BAZEL_PATH}.sha256")
+            ACTUAL=$(shasum -a 256 "$BAZEL_PATH" | awk '{print $1}')
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "Checksum mismatch for $ASSET: expected $EXPECTED, got $ACTUAL"
+              rm -f "$BAZEL_PATH"
+              exit 1
+            fi
+
             chmod +x "$BAZEL_PATH"
             "$BAZEL_PATH" --version
           fi
