@@ -143,7 +143,58 @@ jobs:
 
           echo "Found build-system/fake-codesigning:"
           ls -la build-system/fake-codesigning
+      - name: Regenerate fake provisioning profile (far-future expiry)
+        run: |
+          set -euo pipefail
 
+          cd /Users/Shared/telegram-ios
+
+          PROF_DIR="build-system/fake-codesigning/profiles"
+          if [ ! -d "$PROF_DIR" ]; then
+            PROF_DIR="build-system/fake-codesigning"
+          fi
+
+          echo "Profile dir: $PROF_DIR"
+          ls -la "$PROF_DIR"
+
+          FUTURE_DATE="2035-12-31T23:59:59Z"
+
+          # Regenerate every .mobileprovision found, giving it a future expiry.
+          # rules_apple only parses ExpirationDate + Entitlements from the plist,
+          # so a self-signed CMS blob is sufficient.
+          find "$PROF_DIR" -name '*.mobileprovision' -type f | while read -r prof; do
+            echo "Regenerating $prof"
+
+            # Extract the embedded plist, bump ExpirationDate, re-wrap.
+            TMP="$(mktemp -d)"
+            security cms -D -i "$prof" > "$TMP/payload.plist"
+
+            /usr/libexec/PlistBuddy -c "Set :ExpirationDate $FUTURE_DATE" "$TMP/payload.plist" \
+              || /usr/libexec/PlistBuddy -c "Add :ExpirationDate date $FUTURE_DATE" "$TMP/payload.plist"
+
+            /usr/libexec/PlistBuddy -c "Set :CreationDate $(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TMP/payload.plist" 2>/dev/null || true
+
+            # Re-sign (self-signed) so `security cms -D` still parses it.
+            openssl smime -sign \
+              -in "$TMP/payload.plist" \
+              -signer "$TMP/cert.pem" -inkey "$TMP/key.pem" \
+              -certfile "$TMP/cert.pem" \
+              -outform der -nodetach \
+              -out "$prof" 2>/dev/null || {
+                # Fallback: just write the plist and let rules_apple's parser
+                # fall through to the embedded plist path if it accepts raw XML.
+                echo "::warning::openssl re-sign failed for $prof; writing raw plist"
+                cp "$TMP/payload.plist" "$prof"
+              }
+
+            rm -rf "$TMP"
+          done
+
+          echo "Done. Verifying expiry:"
+          find "$PROF_DIR" -name '*.mobileprovision' -type f -exec sh -c '
+            echo "--- $1"
+            security cms -D -i "$1" 2>/dev/null | grep -A1 ExpirationDate || true
+          ' _ {} \;
       - name: Import fake certificates
         run: |
           set -euo pipefail
