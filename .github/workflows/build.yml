@@ -80,6 +80,7 @@ jobs:
             "enable_icloud": false
           }
           EOF
+
       - name: Pre-download Bazel Binary with Retry
         run: |
           set -euo pipefail
@@ -99,7 +100,7 @@ jobs:
           fi
 
           echo "BAZEL_BIN=$BAZEL_DIR/bazel" >> "$GITHUB_ENV"
- 
+
       - name: Prepare unsigned build
         run: |
           set -euo pipefail
@@ -124,37 +125,24 @@ jobs:
 
           echo "APP_VERSION=$APP_VERSION"
           echo "BUILD_NUMBER=$BUILD_NUMBER"
-      - name: Create dummy provisioning profiles
+
+      - name: Verify fake codesigning data
         run: |
           set -euo pipefail
 
-          SOURCE_DIR=/Users/Shared/telegram-ios
-          PROVISIONING_DIR="$SOURCE_DIR/build-system/fake-provisioning"
+          cd /Users/Shared/telegram-ios
 
-          mkdir -p "$PROVISIONING_DIR"
+          # The repo ships its own placeholder codesigning folder — this is
+          # what build-system/Make/Make.py actually expects via
+          # --codesigningInformationPath. No need to fabricate one.
+          if [ ! -d "build-system/fake-codesigning" ]; then
+            echo "ERROR: build-system/fake-codesigning not found in this checkout."
+            exit 1
+          fi
 
-          # Touch dummy files expected by Telegram target analysis
-          touch "$PROVISIONING_DIR/Telegram.mobileprovision"
-          touch "$PROVISIONING_DIR/Share.mobileprovision"
-          touch "$PROVISIONING_DIR/NotificationService.mobileprovision"
-          touch "$PROVISIONING_DIR/NotificationContent.mobileprovision"
-          touch "$PROVISIONING_DIR/Intents.mobileprovision"
-          touch "$PROVISIONING_DIR/Widget.mobileprovision"
-          touch "$PROVISIONING_DIR/WatchApp.mobileprovision"
-          touch "$PROVISIONING_DIR/WatchExtension.mobileprovision"
+          echo "Found build-system/fake-codesigning:"
+          ls -la build-system/fake-codesigning
 
-          # Point appstore-configuration to the fake profiles directory if needed
-          python3 -c '
-          import json, os
-
-          config_path = "/Users/Shared/telegram-ios/build-system/appstore-configuration.json"
-          if os.path.exists(config_path):
-              with open(config_path, "r") as f:
-                  data = json.load(f)
-              data["provisioning_profiles_path"] = "build-system/fake-provisioning"
-              with open(config_path, "w") as f:
-                  json.dump(data, f, indent=2)
-          '
       - name: Build unsigned IPA
         run: |
           set -euo pipefail
@@ -164,16 +152,15 @@ jobs:
 
           cd "$SOURCE_DIR"
 
-          # Use --bazelArguments instead of --bazelArg
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
             --bazel="$BAZEL_BIN" \
-            --bazelArguments="--//Telegram:disableProvisioningProfiles" \
             build \
             --configurationPath="build-system/appstore-configuration.json" \
+            --codesigningInformationPath="build-system/fake-codesigning" \
+            --disableProvisioningProfiles \
             --configuration=release_arm64 \
-            --buildNumber="$BUILD_NUMBER" \
-            --xcodeManagedCodesigning
+            --buildNumber="$BUILD_NUMBER"
 
           OUTPUT_PATH="build/artifacts"
 
@@ -202,6 +189,7 @@ jobs:
 
           echo "IPA:"
           ls -lh "$OUTPUT_PATH/Telegram.ipa"
+
       - name: Strip signing and provisioning data
         run: |
           set -euo pipefail
