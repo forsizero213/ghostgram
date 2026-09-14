@@ -48,58 +48,6 @@ jobs:
           path: /tmp/bazel-bin-cache
           key: bazel-binary-${{ runner.os }}-${{ hashFiles('versions.json') }}
 
-      - name: Download Bazel
-        run: |
-          set -euo pipefail
-
-          mkdir -p /tmp/bazel-bin-cache
-
-          RAW_BAZEL_FIELD=$(python3 -c '
-          import json
-          with open("versions.json") as f:
-              print(json.load(f)["bazel"])
-          ')
-
-          BAZEL_VERSION="${RAW_BAZEL_FIELD%%:*}"
-          ASSET="bazel-${BAZEL_VERSION}-darwin-arm64"
-          BAZEL_PATH="/tmp/bazel-bin-cache/${ASSET}"
-
-          if [ -x "$BAZEL_PATH" ] && "$BAZEL_PATH" --version >/dev/null 2>&1; then
-            echo "Using cached Bazel $BAZEL_VERSION"
-          else
-            echo "Downloading Bazel $BAZEL_VERSION"
-
-            curl -L \
-              --retry 5 \
-              --retry-all-errors \
-              --fail \
-              -o "$BAZEL_PATH" \
-              "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/${ASSET}"
-
-            curl -L \
-              --retry 5 \
-              --retry-all-errors \
-              --fail \
-              -o "${BAZEL_PATH}.sha256" \
-              "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/${ASSET}.sha256"
-
-            EXPECTED=$(awk '{print $1}' "${BAZEL_PATH}.sha256")
-            ACTUAL=$(shasum -a 256 "$BAZEL_PATH" | awk '{print $1}')
-
-            if [ "$EXPECTED" != "$ACTUAL" ]; then
-              echo "Checksum mismatch for $ASSET"
-              echo "Expected: $EXPECTED"
-              echo "Actual:   $ACTUAL"
-              rm -f "$BAZEL_PATH"
-              exit 1
-            fi
-
-            chmod +x "$BAZEL_PATH"
-            "$BAZEL_PATH" --version
-          fi
-
-          echo "BAZEL_BIN=$BAZEL_PATH" >> "$GITHUB_ENV"
-
       - name: Create canonical source directory
         run: |
           set -euo pipefail
