@@ -134,16 +134,16 @@ jobs:
 
           cd "$SOURCE_DIR"
 
-          # Added --xcodeManagedCodesigning to satisfy Make.py validation
+          # Use --bazelArguments instead of --bazelArg
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
             --bazel="$BAZEL_BIN" \
+            --bazelArguments="--//Telegram:disableProvisioningProfiles" \
             build \
             --configurationPath="build-system/appstore-configuration.json" \
             --configuration=release_arm64 \
             --buildNumber="$BUILD_NUMBER" \
-            --xcodeManagedCodesigning \
-            --bazelArg=--//Telegram:disableProvisioningProfiles
+            --xcodeManagedCodesigning
 
           OUTPUT_PATH="build/artifacts"
 
@@ -172,7 +172,6 @@ jobs:
 
           echo "IPA:"
           ls -lh "$OUTPUT_PATH/Telegram.ipa"
-
       - name: Strip signing and provisioning data
         run: |
           set -euo pipefail
