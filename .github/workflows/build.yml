@@ -133,76 +133,8 @@ jobs:
           }
           EOF
 
-      - name: Patch Make.py for unsigned device builds
-        run: |
-          set -euo pipefail
-
-          cd /Users/Shared/telegram-ios
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("build-system/Make/Make.py")
-          source = path.read_text()
-
-          # Add --disableProvisioningProfiles to the BUILD command.
-          parser_marker = """    buildParser.add_argument(
-              '--enableParallelSwiftmoduleGeneration',
-          """
-
-          parser_insert = """    buildParser.add_argument(
-              '--disableProvisioningProfiles',
-              action='store_true',
-              default=False,
-              help='Build without provisioning profiles for later re-signing.',
-          )
-          buildParser.add_argument(
-              '--enableParallelSwiftmoduleGeneration',
-          """
-
-          if "--disableProvisioningProfiles" not in source[source.find("buildParser ="):]:
-              if parser_marker not in source:
-                  raise SystemExit(
-                      "Could not find build parser insertion point in Make.py"
-                  )
-
-              source = source.replace(
-                  parser_marker,
-                  parser_insert,
-                  1
-              )
-
-          # Make the build command actually pass the existing Bazel flag.
-          build_marker = """    bazel_command_line.set_enable_sandbox(arguments.sandbox)
-              bazel_command_line.set_profile_swift(arguments.profileSwift)
-          """
-
-          build_replacement = """    bazel_command_line.set_enable_sandbox(arguments.sandbox)
-              if arguments.disableProvisioningProfiles:
-                  bazel_command_line.set_disable_provisioning_profiles()
-              bazel_command_line.set_profile_swift(arguments.profileSwift)
-          """
-
-          if "if arguments.disableProvisioningProfiles:" not in source:
-              if build_marker not in source:
-                  raise SystemExit(
-                      "Could not find build configuration insertion point in Make.py"
-                  )
-
-              source = source.replace(
-                  build_marker,
-                  build_replacement,
-                  1
-              )
-
-          path.write_text(source)
-
-          print("Make.py patched successfully.")
-          PY
-
-          python3 -m py_compile build-system/Make/Make.py
-
-      - name: Prepare build
+ 
+      - name: Prepare unsigned build
         run: |
           set -euo pipefail
 
@@ -212,22 +144,20 @@ jobs:
 
           BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
 
-          export APP_VERSION=$(python3 -c '
+          APP_VERSION=$(python3 -c '
           import json
           with open("versions.json") as f:
               print(json.load(f)["app"])
           ')
 
           COMMIT_COUNT="$(git rev-list --count HEAD)"
-          COMMIT_COUNT="$((COMMIT_COUNT + BUILD_NUMBER_OFFSET))"
-
-          export BUILD_NUMBER="$COMMIT_COUNT"
+          BUILD_NUMBER="$((COMMIT_COUNT + BUILD_NUMBER_OFFSET))"
 
           echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
           echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
 
-          echo "App version: $APP_VERSION"
-          echo "Build number: $BUILD_NUMBER"
+          echo "APP_VERSION=$APP_VERSION"
+          echo "BUILD_NUMBER=$BUILD_NUMBER"
 
       - name: Build unsigned IPA
         run: |
@@ -238,39 +168,43 @@ jobs:
 
           cd "$SOURCE_DIR"
 
+          # Generate the build configuration without loading
+          # the expired fake provisioning profiles.
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
             --bazel="$BAZEL_BIN" \
             build \
             --configurationPath="build-system/appstore-configuration.json" \
-            --xcodeManagedCodesigning \
-            --disableProvisioningProfiles \
             --configuration=release_arm64 \
-            --buildNumber="$BUILD_NUMBER"
+            --buildNumber="$BUILD_NUMBER" \
+            --bazelArg=--//Telegram:disableProvisioningProfiles
 
           OUTPUT_PATH="build/artifacts"
 
           rm -rf "$OUTPUT_PATH"
           mkdir -p "$OUTPUT_PATH"
 
+          IPA_PATH=""
+
           if [ -f "bazel-bin/Telegram/Telegram.ipa" ]; then
-            cp "bazel-bin/Telegram/Telegram.ipa" \
-              "$OUTPUT_PATH/Telegram.ipa"
+            IPA_PATH="bazel-bin/Telegram/Telegram.ipa"
           else
             IPA_PATH=$(find bazel-out \
               -path '*/bin/Telegram/Telegram.ipa' \
               -type f \
-              -print -quit)
-
-            if [ -z "$IPA_PATH" ]; then
-              echo "ERROR: Telegram.ipa was not produced."
-              exit 1
-            fi
-
-            cp "$IPA_PATH" "$OUTPUT_PATH/Telegram.ipa"
+              -print -quit || true)
           fi
 
-          echo "IPA before cleanup:"
+          if [ -z "$IPA_PATH" ] || [ ! -f "$IPA_PATH" ]; then
+            echo "ERROR: Telegram.ipa was not produced."
+            exit 1
+          fi
+
+          echo "Found IPA: $IPA_PATH"
+
+          cp "$IPA_PATH" "$OUTPUT_PATH/Telegram.ipa"
+
+          echo "IPA:"
           ls -lh "$OUTPUT_PATH/Telegram.ipa"
 
       - name: Strip signing and provisioning data
