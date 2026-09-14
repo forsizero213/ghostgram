@@ -1,18 +1,13 @@
-name: Debug rules_apple provisioning check
+name: Debug + fix provisioning profiles
 
 on:
   workflow_dispatch:
-    inputs:
-      bazel_version:
-        description: 'Bazel version to use'
-        required: false
-        default: '8.4.2'
 
 permissions:
   contents: read
 
 jobs:
-  diagnose:
+  check-fix-check:
     runs-on: macos-latest
 
     steps:
@@ -22,197 +17,223 @@ jobs:
           submodules: 'recursive'
           fetch-depth: '0'
 
-      - name: Set active Xcode path
+      # ------------------------------------------------------------------
+      # PHASE 1 — CHECK
+      # ------------------------------------------------------------------
+      - name: "PHASE 1 — Check all provisioning profiles"
+        id: check1
         run: |
           set -euo pipefail
-          XCODE_VERSION=$(python3 -c '
-          import json
-          with open("versions.json") as f:
-              print(json.load(f)["xcode"])
-          ')
-          echo "Using Xcode $XCODE_VERSION"
-          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
-          xcodebuild -version
 
-      - name: Download Bazel
-        run: |
-          set -euo pipefail
-          BAZEL_VERSION="${{ github.event.inputs.bazel_version }}"
-          BAZEL_DIR="/tmp/bazel-bin-cache"
-          mkdir -p "$BAZEL_DIR"
+          PROF_DIR="build-system/fake-codesigning/profiles"
+          echo "Profile dir: $PROF_DIR"
+          ls -la "$PROF_DIR"
 
-          if [ ! -f "$BAZEL_DIR/bazel" ]; then
-            curl --retry 10 --retry-delay 5 --retry-max-time 120 --connect-timeout 15 \
-              -sSL "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-darwin-arm64" \
-              -o "$BAZEL_DIR/bazel"
-            chmod +x "$BAZEL_DIR/bazel"
-          fi
+          NOW_EPOCH=$(date -u +%s)
+          BROKEN=0
 
-          echo "BAZEL_BIN=$BAZEL_DIR/bazel" >> "$GITHUB_ENV"
-          "$BAZEL_DIR/bazel" --version
-
-      - name: Dump environment info
-        run: |
-          set -euo pipefail
-          echo "=== uname ==="
-          uname -a
           echo
-          echo "=== python ==="
-          python3 --version
-          echo
-          echo "=== openssl ==="
-          openssl version
-          echo
-          echo "=== .bazelrc (repo root) ==="
-          cat .bazelrc 2>/dev/null || echo "(no .bazelrc at repo root)"
-          echo
-          echo "=== any other .bazelrc files ==="
-          find . -maxdepth 3 -name '.bazelrc*' -not -path './.git/*' 2>/dev/null || true
-          echo
-          echo "=== versions.json ==="
-          cat versions.json 2>/dev/null || echo "(no versions.json)"
-          echo
-          echo "=== .bazelversion ==="
-          cat .bazelversion 2>/dev/null || echo "(no .bazelversion)"
-
-      - name: Dump fake-codesigning tree
-        run: |
-          set -euo pipefail
-          echo "=== build-system/fake-codesigning ==="
-          find build-system/fake-codesigning -type f -exec ls -la {} + 2>/dev/null || true
-          echo
-          echo "=== each .mobileprovision: type + decoded expiry ==="
-          find build-system/fake-codesigning -name '*.mobileprovision' -type f | while read -r f; do
-            echo "--- $f"
-            file "$f" || true
+          echo "=== Decoding every .mobileprovision ==="
+          for f in "$PROF_DIR"/*.mobileprovision; do
+            echo "----------------------------------------"
+            echo "FILE: $f"
+            echo "size: $(stat -f%z "$f") bytes"
+            echo "type: $(file -b "$f")"
             echo "first 16 bytes:"
-            head -c 16 "$f" | xxd || true
-            echo "decoded plist (ExpirationDate/CreationDate/Name):"
-            security cms -D -i "$f" 2>/dev/null \
-              | grep -A1 -E "ExpirationDate|CreationDate|<key>Name</key>" || echo "  (cannot decode)"
+            head -c 16 "$f" | xxd
+
+            DECODED="$(security cms -D -i "$f" 2>/dev/null || true)"
+            if [ -z "$DECODED" ]; then
+              echo "  STATUS: CORRUPT (cannot decode as CMS)"
+              BROKEN=1
+              continue
+            fi
+
+            EXP="$(printf '%s' "$DECODED" | grep -A1 '<key>ExpirationDate</key>' | grep '<date>' | sed -E 's/.*<date>(.*)<\/date>.*/\1/' || true)"
+            NAME="$(printf '%s' "$DECODED" | grep -A1 '<key>Name</key>' | grep '<string>' | sed -E 's/.*<string>(.*)<\/string>.*/\1/' || true)"
+
+            echo "  Name:           $NAME"
+            echo "  ExpirationDate: $EXP"
+
+            if [ -z "$EXP" ]; then
+              echo "  STATUS: NO EXPIRY DATE"
+              BROKEN=1
+              continue
+            fi
+
+            EXP_EPOCH=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$EXP" +%s 2>/dev/null || echo 0)
+            if [ "$EXP_EPOCH" -le "$NOW_EPOCH" ]; then
+              echo "  STATUS: EXPIRED (now is $(date -u +%Y-%m-%dT%H:%M:%SZ))"
+              BROKEN=1
+            else
+              echo "  STATUS: OK"
+            fi
           done
 
-      - name: Fetch external repos
+          echo
+          echo "BROKEN=$BROKEN"
+          echo "broken=$BROKEN" >> "$GITHUB_OUTPUT"
+
+      - name: "PHASE 1 — Summary"
         run: |
-          set -euo pipefail
-          "$BAZEL_BIN" \
-            --output_user_root=/private/var/tmp/_bazel_containerhost \
-            fetch //Telegram:Telegram 2>&1 | tail -n 200 || true
-
-      - name: Locate rules_apple
-        id: locate
-        run: |
-          set -euo pipefail
-          ROOT=/private/var/tmp/_bazel_containerhost
-
-          echo "=== output_user_root ==="
-          ls -la "$ROOT" || true
-
-          RA_DIR=$(find "$ROOT" -maxdepth 4 -type d -name "rules_apple+*" 2>/dev/null | head -1 || true)
-          if [ -z "$RA_DIR" ]; then
-            RA_DIR=$(find "$ROOT" -maxdepth 4 -type d -name "*rules_apple*" 2>/dev/null | head -1 || true)
+          if [ "${{ steps.check1.outputs.broken }}" = "1" ]; then
+            echo "::warning::Some provisioning profiles are broken or expired."
+          else
+            echo "::notice::All provisioning profiles are valid."
           fi
 
-          echo "rules_apple dir: $RA_DIR"
-          echo "ra_dir=$RA_DIR" >> "$GITHUB_OUTPUT"
+      # ------------------------------------------------------------------
+      # PHASE 2 — FIX (only runs if phase 1 found problems)
+      # ------------------------------------------------------------------
+      - name: "PHASE 2 — Fix broken profiles"
+        if: steps.check1.outputs.broken == '1'
+        run: |
+          set -euo pipefail
 
-          if [ -z "$RA_DIR" ]; then
-            echo "Could not find rules_apple. Dumping what IS present under external:"
-            find "$ROOT" -maxdepth 3 -type d -name 'external' -exec ls {} \; 2>/dev/null || true
+          PROF_DIR="build-system/fake-codesigning/profiles"
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$WORK"' EXIT
+
+          # Self-signed cert/key to wrap plists as CMS.
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$WORK/key.pem" -out "$WORK/cert.pem" \
+            -days 3650 -subj "/CN=Fake Provisioning" 2>/dev/null
+
+          FUTURE_DATE="2035-12-31T23:59:59Z"
+          NOW_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          NOW_EPOCH=$(date -u +%s)
+
+          for f in "$PROF_DIR"/*.mobileprovision; do
+            echo "========================================"
+            echo "Evaluating: $f"
+
+            DECODED="$(security cms -D -i "$f" 2>/dev/null || true)"
+
+            if [ -n "$DECODED" ]; then
+              # Decodable — check whether it actually needs fixing.
+              EXP="$(printf '%s' "$DECODED" | grep -A1 '<key>ExpirationDate</key>' | grep '<date>' | sed -E 's/.*<date>(.*)<\/date>.*/\1/' || true)"
+              EXP_EPOCH=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "${EXP:-1970-01-01T00:00:00Z}" +%s 2>/dev/null || echo 0)
+
+              if [ -n "$EXP" ] && [ "$EXP_EPOCH" -gt "$NOW_EPOCH" ]; then
+                echo "  Still valid (expires $EXP). Skipping."
+                continue
+              fi
+
+              echo "  Needs fixing (expiry: ${EXP:-none})."
+
+              printf '%s' "$DECODED" > "$WORK/payload.plist"
+
+              /usr/libexec/PlistBuddy -c "Set :ExpirationDate $FUTURE_DATE" "$WORK/payload.plist" \
+                || /usr/libexec/PlistBuddy -c "Add :ExpirationDate date $FUTURE_DATE" "$WORK/payload.plist"
+
+              /usr/libexec/PlistBuddy -c "Set :CreationDate $NOW_DATE" "$WORK/payload.plist" 2>/dev/null \
+                || /usr/libexec/PlistBuddy -c "Add :CreationDate date $NOW_DATE" "$WORK/payload.plist" 2>/dev/null \
+                || true
+            else
+              # Not decodable — rebuild from scratch, keeping just the filename
+              # as a hint for the profile name.
+              echo "  Undecodable. Rebuilding from scratch."
+
+              BASE="$(basename "$f" .mobileprovision)"
+              cat > "$WORK/payload.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Name</key>
+  <string>fake-${BASE}</string>
+  <key>UUID</key>
+  <string>$(uuidgen)</string>
+  <key>TeamIdentifier</key>
+  <array><string>C67CF9S4VU</string></array>
+  <key>CreationDate</key>
+  <date>${NOW_DATE}</date>
+  <key>ExpirationDate</key>
+  <date>${FUTURE_DATE}</date>
+  <key>Entitlements</key>
+  <dict>
+    <key>application-identifier</key>
+    <string>C67CF9S4VU.ph.telegra.Telegraph</string>
+    <key>com.apple.developer.team-identifier</key>
+    <string>C67CF9S4VU</string>
+    <key>get-task-allow</key>
+    <false/>
+  </dict>
+</dict>
+</plist>
+EOF
+            fi
+
+            # Sign to a temp blob.
+            openssl smime -sign \
+              -signer "$WORK/cert.pem" \
+              -inkey  "$WORK/key.pem" \
+              -certfile "$WORK/cert.pem" \
+              -in "$WORK/payload.plist" \
+              -outform der -nodetach \
+              -out "$WORK/new.prof"
+
+            # Verify before replacing.
+            openssl smime -verify -noverify -inform der -in "$WORK/new.prof" >/dev/null
+            security cms -D -i "$WORK/new.prof" >/dev/null
+
+            mv "$WORK/new.prof" "$f"
+            echo "  Replaced."
+          done
+
+      # ------------------------------------------------------------------
+      # PHASE 3 — CHECK AGAIN
+      # ------------------------------------------------------------------
+      - name: "PHASE 3 — Re-check all provisioning profiles"
+        id: check2
+        run: |
+          set -euo pipefail
+
+          PROF_DIR="build-system/fake-codesigning/profiles"
+          NOW_EPOCH=$(date -u +%s)
+          BROKEN=0
+
+          for f in "$PROF_DIR"/*.mobileprovision; do
+            echo "----------------------------------------"
+            echo "FILE: $f"
+            DECODED="$(security cms -D -i "$f" 2>/dev/null || true)"
+            if [ -z "$DECODED" ]; then
+              echo "  STATUS: STILL CORRUPT"
+              BROKEN=1
+              continue
+            fi
+
+            EXP="$(printf '%s' "$DECODED" | grep -A1 '<key>ExpirationDate</key>' | grep '<date>' | sed -E 's/.*<date>(.*)<\/date>.*/\1/' || true)"
+            EXP_EPOCH=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "${EXP:-1970-01-01T00:00:00Z}" +%s 2>/dev/null || echo 0)
+
+            if [ "$EXP_EPOCH" -le "$NOW_EPOCH" ]; then
+              echo "  STATUS: STILL EXPIRED ($EXP)"
+              BROKEN=1
+            else
+              echo "  STATUS: OK ($EXP)"
+            fi
+          done
+
+          echo "broken=$BROKEN" >> "$GITHUB_OUTPUT"
+
+      - name: "PHASE 3 — Verdict"
+        run: |
+          if [ "${{ steps.check2.outputs.broken }}" = "1" ]; then
+            echo "::error::After fixing, some profiles are still broken. See Phase 3 logs."
+            exit 1
           fi
-
-      - name: Grep rules_apple for expiry logic
-        if: steps.locate.outputs.ra_dir != ''
-        run: |
-          set -euo pipefail
-          RA_DIR="${{ steps.locate.outputs.ra_dir }}"
-          echo "Scanning $RA_DIR"
-
+          echo "::notice::All provisioning profiles are valid after fix."
           echo
-          echo "=== files mentioning ExpirationDate ==="
-          grep -rln "ExpirationDate" "$RA_DIR" 2>/dev/null || true
+          echo "To bake the fix into the repo, download the patched files and commit them."
+          echo "See the 'Upload patched profiles' artifact below."
 
-          echo
-          echo "=== matches with context ==="
-          grep -rn -B3 -A8 "ExpirationDate" "$RA_DIR" 2>/dev/null | head -200 || true
-
-          echo
-          echo "=== anything mentioning provisioning_profile_expiration ==="
-          grep -rn "provisioning_profile_expiration" "$RA_DIR" 2>/dev/null | head -50 || true
-
-          echo
-          echo "=== anything mentioning apple.provisioning ==="
-          grep -rn "apple\.provisioning" "$RA_DIR" 2>/dev/null | head -50 || true
-
-          echo
-          echo "=== config_setting blocks referencing provisioning ==="
-          grep -rn -B2 -A6 "config_setting" "$RA_DIR" 2>/dev/null \
-            | grep -i -B2 -A6 "provision" | head -100 || true
-
-      - name: Find the exact source file that raises the error
-        if: steps.locate.outputs.ra_dir != ''
-        run: |
-          set -euo pipefail
-          RA_DIR="${{ steps.locate.outputs.ra_dir }}"
-
-          echo "=== searching for 'is in the past' ==="
-          grep -rn "is in the past" "$RA_DIR" 2>/dev/null || true
-
-          echo
-          echo "=== searching plisttool sources ==="
-          find "$RA_DIR" -path '*plisttool*' -name '*.py' -o -path '*plisttool*' -name '*.bzl' 2>/dev/null | head -50 || true
-
-          echo
-          echo "=== grep plisttool dir for ExpirationDate ==="
-          PT_DIR=$(find "$RA_DIR" -maxdepth 4 -type d -name plisttool 2>/dev/null | head -1 || true)
-          echo "plisttool dir: $PT_DIR"
-          if [ -n "$PT_DIR" ]; then
-            grep -rn "ExpirationDate" "$PT_DIR" 2>/dev/null | head -50 || true
-            echo
-            echo "=== files in plisttool ==="
-            ls -la "$PT_DIR"
-          fi
-
-      - name: Grep any select() gated on a --define near expiry
-        if: steps.locate.outputs.ra_dir != ''
-        run: |
-          set -euo pipefail
-          RA_DIR="${{ steps.locate.outputs.ra_dir }}"
-
-          echo "=== all --define strings referenced in rules_apple ==="
-          grep -rn -- "--define=" "$RA_DIR" 2>/dev/null | head -100 || true
-
-          echo
-          echo "=== all config_setting names containing 'provision' or 'profile' ==="
-          grep -rn -A5 "config_setting(" "$RA_DIR" 2>/dev/null \
-            | grep -i -B1 -A5 "provision\|profile" | head -100 || true
-
-      - name: Grep for skip / ignore / disable knobs
-        if: steps.locate.outputs.ra_dir != ''
-        run: |
-          set -euo pipefail
-          RA_DIR="${{ steps.locate.outputs.ra_dir }}"
-
-          echo "=== any env var / define / attribute mentioning skip, ignore, disable ==="
-          grep -rn -i "skip.*provision\|provision.*skip" "$RA_DIR" 2>/dev/null | head -50 || true
-          grep -rn -i "ignore.*provision\|provision.*ignore" "$RA_DIR" 2>/dev/null | head -50 || true
-          grep -rn -i "disable.*provision\|provision.*disable" "$RA_DIR" 2>/dev/null | head -50 || true
-
-      - name: Also scan any local patched rules_apple copy in the repo
-        run: |
-          set -euo pipefail
-          echo "=== repo-local patches to rules_apple? ==="
-          find . -path ./.git -prune -o -type d -name "rules_apple*" -print 2>/dev/null | head
-          find . -path ./.git -prune -o -type f -name "*.patch" -print 2>/dev/null | head -50
-          find . -path ./.git -prune -o -type f -name "MODULE.bazel" -print 2>/dev/null | head -20
-
-      - name: Summary
-        if: always()
-        run: |
-          echo "Diagnostic complete."
-          echo "Paste the logs of these steps back:"
-          echo "  - 'Dump fake-codesigning tree'"
-          echo "  - 'Grep rules_apple for expiry logic'"
-          echo "  - 'Find the exact source file that raises the error'"
-          echo "  - 'Grep any select() gated on a --define near expiry'"
-          echo "  - 'Grep for skip / ignore / disable knobs'"
+      # ------------------------------------------------------------------
+      # Publish the fixed profiles so you can commit them into the repo.
+      # ------------------------------------------------------------------
+      - name: Upload patched profiles
+        if: steps.check1.outputs.broken == '1' && steps.check2.outputs.broken == '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-provisioning-profiles
+          path: build-system/fake-codesigning/profiles/*.mobileprovision
+          if-no-files-found: error
