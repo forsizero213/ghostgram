@@ -67,6 +67,9 @@ jobs:
 
           cd $SOURCE_DIR
 
+          # Ensure build-input is completely clean so Bazel redownloads properly
+          rm -rf build-input
+
           BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
 
           export APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"]);')
@@ -78,7 +81,6 @@ jobs:
 
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
 
-          # Вызов сборки с базовой папкой build-system/fake-codesigning из исходников
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
             build \
