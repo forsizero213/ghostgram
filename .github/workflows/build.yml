@@ -80,7 +80,25 @@ jobs:
             "enable_icloud": false
           }
           EOF
+      - name: Pre-download Bazel Binary with Retry
+        run: |
+          set -euo pipefail
+          BAZEL_VERSION="8.4.2"
+          BAZEL_DIR="/tmp/bazel-bin-cache"
+          mkdir -p "$BAZEL_DIR"
 
+          if [ ! -f "$BAZEL_DIR/bazel" ]; then
+            echo "Downloading Bazel $BAZEL_VERSION..."
+            curl --retry 10 \
+                 --retry-delay 5 \
+                 --retry-max-time 120 \
+                 --connect-timeout 15 \
+                 -sSL "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-darwin-arm64" \
+                 -o "$BAZEL_DIR/bazel"
+            chmod +x "$BAZEL_DIR/bazel"
+          fi
+
+          echo "BAZEL_BIN=$BAZEL_DIR/bazel" >> "$GITHUB_ENV"
  
       - name: Prepare unsigned build
         run: |
