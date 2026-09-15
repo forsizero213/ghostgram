@@ -76,49 +76,24 @@ jobs:
           }
           EOF
 
-      - name: Fix expired BroadcastUpload provisioning profile
+      - name: Verify profiles have fake cert (sanity check)
         run: |
           set -euo pipefail
-
           cd /Users/Shared/telegram-ios
-
-          # Restore from git in case a previous run corrupted it.
-          git checkout HEAD -- build-system/fake-codesigning/profiles/BroadcastUpload.mobileprovision
-
-          PROF="build-system/fake-codesigning/profiles/BroadcastUpload.mobileprovision"
-          WORK="$(mktemp -d)"
-          trap 'rm -rf "$WORK"' EXIT
-
-          # Self-signed cert/key just to wrap the plist as CMS.
-          openssl req -x509 -newkey rsa:2048 -nodes \
-            -keyout "$WORK/key.pem" -out "$WORK/cert.pem" \
-            -days 3650 -subj "/CN=Fake Provisioning" 2>/dev/null
-
-          # Decode existing CMS blob into a plist.
-          security cms -D -i "$PROF" > "$WORK/payload.plist"
-
-          # Bump expiry far into the future.
-          FUTURE_DATE="2035-12-31T23:59:59Z"
-          /usr/libexec/PlistBuddy -c "Set :ExpirationDate $FUTURE_DATE" "$WORK/payload.plist" \
-            || /usr/libexec/PlistBuddy -c "Add :ExpirationDate date $FUTURE_DATE" "$WORK/payload.plist"
-
-          # Re-wrap as DER CMS. No fallback — if this fails, set -e aborts
-          # and the original file is never touched.
-          openssl smime -sign \
-            -signer "$WORK/cert.pem" \
-            -inkey  "$WORK/key.pem" \
-            -certfile "$WORK/cert.pem" \
-            -in "$WORK/payload.plist" \
-            -outform der -nodetach \
-            -out "$WORK/new.prof"
-
-          # Verify the new blob parses cleanly before replacing the original.
-          openssl smime -verify -noverify -inform der -in "$WORK/new.prof" >/dev/null
-
-          mv "$WORK/new.prof" "$PROF"
-
-          echo "Patched: $PROF"
-          security cms -D -i "$PROF" | grep -A1 ExpirationDate
+          PUB="build-system/fake-codesigning/certs/Public.cer"
+          PUB_SHA="$(shasum -a 256 "$PUB" | awk '{print $1}')"
+          echo "Public.cer sha256 = $PUB_SHA"
+          FAIL=0
+          for f in build-system/fake-codesigning/profiles/*.mobileprovision; do
+            DECODED="$(security cms -D -i "$f" 2>/dev/null || true)"
+            COUNT=$(printf '%s' "$DECODED" | grep -c '<key>DeveloperCertificates</key>' || true)
+            echo "$f  DeveloperCertificates=$COUNT"
+            if [ "$COUNT" -lt 1 ]; then
+              echo "::error::$f missing DeveloperCertificates"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" = "1" ]; then exit 1; fi
 
       - name: Pre-download Bazel Binary with Retry
         run: |
@@ -139,6 +114,7 @@ jobs:
         run: |
           set -euo pipefail
           cd /Users/Shared/telegram-ios
+
           rm -rf build-input
 
           BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
@@ -157,6 +133,15 @@ jobs:
           echo "APP_VERSION=$APP_VERSION"
           echo "BUILD_NUMBER=$BUILD_NUMBER"
 
+      - name: Nuke cached build_configuration+ from Bazel output root
+        run: |
+          set -euo pipefail
+          BAZEL_ROOT="/private/var/tmp/_bazel_containerhost"
+          echo "Removing cached build_configuration+ repos from $BAZEL_ROOT..."
+          find "$BAZEL_ROOT" -maxdepth 3 -type d -name "build_configuration+" -print -exec rm -rf {} + 2>/dev/null || true
+          find "$BAZEL_ROOT" -maxdepth 3 -type d -name "build_configuration+*" -print -exec rm -rf {} + 2>/dev/null || true
+          echo "Done."
+
       - name: Verify fake codesigning data
         run: |
           set -euo pipefail
@@ -173,6 +158,23 @@ jobs:
           cd /Users/Shared/telegram-ios
           python3 build-system/Make/ImportCertificates.py \
             --path build-system/fake-codesigning/certs
+
+      - name: Debug Make.py config source
+        run: |
+          set -euo pipefail
+          cd /Users/Shared/telegram-ios
+
+          echo "=== source tree profiles ==="
+          ls -la build-system/fake-codesigning/profiles/ | head
+
+          echo
+          echo "=== existing build-input ==="
+          ls -la build-input/ 2>/dev/null || echo "no build-input"
+
+          echo
+          echo "=== Make.py references to provisioning / fake-codesigning ==="
+          grep -rn "provisioning\|fake-codesigning\|configuration-repository" \
+            build-system/Make/*.py 2>/dev/null | head -50 || true
 
       - name: Build unsigned IPA
         run: |
