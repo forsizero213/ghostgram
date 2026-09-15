@@ -1,176 +1,255 @@
-name: Debug Telegram disableProvisioningProfiles
+version: "1.0"
+description: >
+  Diagnostic suite for Telegram-iOS / Ghostgram Bazel build failures related
+  to code signing, provisioning profiles, and code signing identities.
+  Focus: the error "Unable to find an identity on the system matching the
+  ones in .../Widget.mobileprovision".
 
-on:
-  workflow_dispatch:
+meta:
+  repo_root: "/Users/Shared/telegram-ios"
+  provisioning_dir: "external/build_configuration+/provisioning"
+  certs_dir: "build-system/fake-codesigning/certs"
+  bazel_output_root: "/private/var/tmp/_bazel_containerhost"
 
-permissions:
-  contents: read
+checks:
 
-jobs:
-  debug:
-    runs-on: macos-latest
+  # ---------------------------------------------------------------
+  # 1. System / environment
+  # ---------------------------------------------------------------
+  - id: macos_version
+    desc: macOS version and build
+    cmd: sw_vers
+    expect: "non-empty"
+    severity: info
 
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: 'recursive'
-          fetch-depth: '0'
+  - id: xcode_version
+    desc: Active Xcode version (Telegram pins to a specific Xcode)
+    cmd: xcodebuild -version
+    expect: "non-empty"
+    severity: warn
 
-      - name: Set active Xcode path
-        run: |
-          set -euo pipefail
-          XCODE_VERSION=$(python3 -c '
-          import json
-          with open("versions.json") as f:
-              print(json.load(f)["xcode"])
-          ')
-          echo "Using Xcode $XCODE_VERSION"
-          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
-          xcodebuild -version
+  - id: xcode_select
+    desc: Active developer directory
+    cmd: xcode-select -p
+    expect: "/Applications/Xcode"
+    severity: warn
 
-      - name: Create canonical source directory
-        run: |
-          set -euo pipefail
-          sudo mkdir -p /Users/Shared
-          rm -rf /Users/Shared/telegram-ios
-          cp -R "$GITHUB_WORKSPACE" /Users/Shared/telegram-ios
+  - id: arch
+    desc: Host architecture (must be arm64 for this build)
+    cmd: uname -m
+    expect: "arm64"
+    severity: warn
 
-      - name: Setup Minimal Configuration
-        run: |
-          set -euo pipefail
-          cd /Users/Shared/telegram-ios
-          cat << 'EOF' > build-system/appstore-configuration.json
-          {
-            "bundle_id": "ph.telegra.Telegraph",
-            "api_id": "34064276",
-            "api_hash": "79d1eeba6d4521f29a81dc40db4ec79a",
-            "team_id": "C67CF9S4VU",
-            "app_center_id": "0",
-            "is_internal_build": "false",
-            "is_appstore_build": "true",
-            "appstore_id": "0",
-            "app_specific_url_scheme": "tg",
-            "premium_iap_product_id": "",
-            "enable_siri": false,
-            "enable_icloud": false
-          }
-          EOF
+  # ---------------------------------------------------------------
+  # 2. Keychain / signing identities
+  # ---------------------------------------------------------------
+  - id: signing_identities
+    desc: All valid code signing identities in the default search list
+    cmd: security find-identity -v -p codesigning
+    expect: "contains at least one valid identity"
+    severity: critical
+    hints:
+      - "If empty: cert missing or untrusted. Install Apple WWDR intermediates."
+      - "If 'CSSMERR_TP_NOT_TRUSTED': fix trust in Keychain Access."
 
-      - name: Pre-download Bazel Binary
-        run: |
-          set -euo pipefail
-          BAZEL_VERSION="8.4.2"
-          BAZEL_DIR="/tmp/bazel-bin-cache"
-          mkdir -p "$BAZEL_DIR"
-          if [ ! -f "$BAZEL_DIR/bazel" ]; then
-            echo "Downloading Bazel $BAZEL_VERSION..."
-            curl --retry 10 --retry-delay 5 --retry-max-time 120 --connect-timeout 15 \
-              -sSL "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-darwin-arm64" \
-              -o "$BAZEL_DIR/bazel"
-            chmod +x "$BAZEL_DIR/bazel"
-          fi
-          echo "BAZEL_BIN=$BAZEL_DIR/bazel" >> "$GITHUB_ENV"
+  - id: signing_identities_all_keychains
+    desc: Signing identities across every keychain on the system
+    cmd: security find-identity -v -p codesigning $(security list-keychains -d user | tr -d '\"')
+    expect: "non-empty"
+    severity: info
 
-      - name: Prepare build
-        run: |
-          set -euo pipefail
-          cd /Users/Shared/telegram-ios
+  - id: default_keychain
+    desc: Which keychain is the default (Bazel uses default search list)
+    cmd: security default-keychain
+    expect: "login.keychain"
+    severity: warn
 
-          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
-          APP_VERSION=$(python3 -c '
-          import json
-          with open("versions.json") as f:
-              print(json.load(f)["app"])
-          ')
+  - id: keychain_list
+    desc: User keychain search list
+    cmd: security list-keychains -d user
+    expect: "includes login.keychain-db"
+    severity: warn
 
-          COMMIT_COUNT="$(git rev-list --count HEAD)"
-          BUILD_NUMBER="$((COMMIT_COUNT + BUILD_NUMBER_OFFSET))"
+  - id: login_keychain_unlocked
+    desc: Is the login keychain unlocked
+    cmd: security show-keychain-info ~/Library/Keychains/login.keychain-db 2>&1
+    expect: "no error"
+    severity: critical
 
-          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
-          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+  - id: apple_dev_certs
+    desc: Apple Development certificates present
+    cmd: security find-certificate -a -c "Apple Development" -Z
+    expect: "non-empty"
+    severity: critical
 
-      - name: Test 1 - Verify flag is in BUILD file
-        run: |
-          set -euo pipefail
-          cd /Users/Shared/telegram-ios
-          
-          echo "=== Checking if disableProvisioningProfiles is defined in Telegram BUILD ==="
-          grep -n "disableProvisioningProfiles" Telegram/BUILD || echo "NOT FOUND in BUILD file"
-          
-          echo
-          echo "=== Checking Bazel config flags ==="
-          grep -rn "disableProvisioningProfiles" . --include="*.bazel" --include="*.bzl" 2>/dev/null | head -20 || echo "NOT FOUND in bazel files"
+  - id: apple_dist_certs
+    desc: Apple Distribution certificates present
+    cmd: security find-certificate -a -c "Apple Distribution" -Z
+    expect: "non-empty"
+    severity: warn
 
-      - name: Test 2 - Try build with --bazelArguments flag
-        run: |
-          set -euo pipefail
+  - id: wwdr_intermediates
+    desc: Apple WWDR intermediate certs (needed for trust chain)
+    cmd: security find-certificate -a -c "Apple Worldwide Developer Relations" -Z
+    expect: "non-empty"
+    severity: critical
 
-          SOURCE_DIR=/Users/Shared/telegram-ios
-          BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
+  # ---------------------------------------------------------------
+  # 3. Provisioning profiles shipped with the repo
+  # ---------------------------------------------------------------
+  - id: widget_profile_exists
+    desc: Widget provisioning profile exists in the repo
+    cmd: test -f {{repo_root}}/{{provisioning_dir}}/Widget.mobileprovision && echo OK || echo MISSING
+    expect: "OK"
+    severity: critical
 
-          cd "$SOURCE_DIR"
+  - id: widget_profile_team
+    desc: Team ID embedded in Widget.mobileprovision
+    cmd: security cms -D -i {{repo_root}}/{{provisioning_dir}}/Widget.mobileprovision | plutil -extract TeamIdentifier.0 raw -
+    expect: "non-empty"
+    severity: critical
 
-          echo "=== Attempting build with --bazelArguments flag ==="
-          python3 -u build-system/Make/Make.py \
-            --verbose \
-            --bazelUserRoot="$BAZEL_USER_ROOT" \
-            --bazel="$BAZEL_BIN" \
-            --bazelArguments="--//Telegram:disableProvisioningProfiles" \
-            build \
-            --configurationPath="build-system/appstore-configuration.json" \
-            --codesigningInformationPath="build-system/fake-codesigning" \
-            --configuration=release_arm64 \
-            --buildNumber="$BUILD_NUMBER" \
-            2>&1 | head -100 || true
-        continue-on-error: true
+  - id: widget_profile_name
+    desc: Display name of the Widget provisioning profile
+    cmd: security cms -D -i {{repo_root}}/{{provisioning_dir}}/Widget.mobileprovision | plutil -extract Name raw -
+    expect: "non-empty"
+    severity: info
 
-      - name: Test 3 - Check Make.py for how disableProvisioningProfiles is used
-        run: |
-          set -euo pipefail
-          cd /Users/Shared/telegram-ios
-          
-          echo "=== How Make.py uses disableProvisioningProfiles ==="
-          grep -B5 -A5 "disable_provisioning_profiles\|disableProvisioningProfiles" build-system/Make/Make.py | head -50
+  - id: widget_profile_uuid
+    desc: UUID of the Widget provisioning profile
+    cmd: security cms -D -i {{repo_root}}/{{provisioning_dir}}/Widget.mobileprovision | plutil -extract UUID raw -
+    expect: "non-empty"
+    severity: info
 
-      - name: Test 4 - Check if flag needs to be added to argument parser
-        run: |
-          set -euo pipefail
-          cd /Users/Shared/telegram-ios
-          
-          echo "=== Checking if --disableProvisioningProfiles is in argument parser ==="
-          grep -n "disableProvisioningProfiles" build-system/Make/Make.py | grep -i "add_argument\|argparse" || echo "NOT in argument parser"
-          
-          echo
-          echo "=== Full grep for disableProvisioningProfiles in Make.py ==="
-          grep -n "disableProvisioningProfiles" build-system/Make/Make.py
+  - id: widget_profile_expiry
+    desc: Expiration of the Widget provisioning profile
+    cmd: security cms -D -i {{repo_root}}/{{provisioning_dir}}/Widget.mobileprovision | plutil -extract ExpirationDate raw -
+    expect: "in the future"
+    severity: critical
 
-      - name: Test 5 - Inspect BuildConfiguration.py
-        run: |
-          set -euo pipefail
-          cd /Users/Shared/telegram-ios
-          
-          echo "=== BuildConfiguration.py usage of disable_provisioning_profiles ==="
-          grep -B3 -A3 "disable_provisioning_profiles" build-system/Make/BuildConfiguration.py | head -60
+  - id: widget_profile_certs
+    desc: Certificate serials allowed by Widget.mobileprovision
+    cmd: security cms -D -i {{repo_root}}/{{provisioning_dir}}/Widget.mobileprovision | plutil -extract DeveloperCertificates raw - | head -5
+    expect: "list of serials"
+    severity: info
 
-      - name: Test 6 - Try without the flag (fallback)
-        run: |
-          set -euo pipefail
+  - id: all_shipped_profiles
+    desc: Every provisioning profile shipped with the build
+    cmd: ls -la {{repo_root}}/{{provisioning_dir}}/
+    expect: "non-empty"
+    severity: info
 
-          SOURCE_DIR=/Users/Shared/telegram-ios
-          BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
+  # ---------------------------------------------------------------
+  # 4. Fake codesigning certs (Ghostgram)
+  # ---------------------------------------------------------------
+  - id: fake_certs_dir
+    desc: Fake codesigning certs directory from Ghostgram
+    cmd: ls -la {{repo_root}}/{{certs_dir}}/
+    expect: "non-empty"
+    severity: warn
 
-          cd "$SOURCE_DIR"
+  - id: fake_public_cer
+    desc: Public.cer present
+    cmd: test -f {{repo_root}}/{{certs_dir}}/Public.cer && echo OK || echo MISSING
+    expect: "OK"
+    severity: warn
 
-          echo "=== Attempting build WITHOUT disableProvisioningProfiles flag ==="
-          echo "This will likely fail with provisioning profile error, but shows the baseline"
-          python3 -u build-system/Make/Make.py \
-            --verbose \
-            --bazelUserRoot="$BAZEL_USER_ROOT" \
-            --bazel="$BAZEL_BIN" \
-            build \
-            --configurationPath="build-system/appstore-configuration.json" \
-            --codesigningInformationPath="build-system/fake-codesigning" \
-            --configuration=release_arm64 \
-            --buildNumber="$BUILD_NUMBER" \
-            2>&1 | head -100 || true
-        continue-on-error: true
+  - id: fake_public_cer_info
+    desc: Subject / issuer of the fake Public.cer
+    cmd: openssl x509 -inform DER -in {{repo_root}}/{{certs_dir}}/Public.cer -noout -subject -issuer -dates 2>&1 || openssl x509 -in {{repo_root}}/{{certs_dir}}/Public.cer -noout -subject -issuer -dates
+    expect: "subject present"
+    severity: info
+
+  - id: fake_public_cer_sha
+    desc: SHA1 of fake Public.cer (compare with identity output)
+    cmd: openssl x509 -inform DER -in {{repo_root}}/{{certs_dir}}/Public.cer -noout -fingerprint -sha1 2>&1
+    expect: "SHA1 Fingerprint"
+    severity: info
+
+  - id: fake_private_key
+    desc: Private key matching Public.cer (usually NOT committed)
+    cmd: ls -la {{repo_root}}/{{certs_dir}}/Private.p12 2>&1 || echo "not present"
+    expect: "either present or explicitly absent"
+    severity: info
+
+  # ---------------------------------------------------------------
+  # 5. Build config the Bazel rules will use
+  # ---------------------------------------------------------------
+  - id: build_configuration_dir
+    desc: Contents of external/build_configuration+
+    cmd: ls -la {{repo_root}}/external/build_configuration+/ 2>&1
+    expect: "non-empty"
+    severity: info
+
+  - id: team_id_in_build_config
+    desc: Any hard-coded DEVELOPMENT_TEAM / TEAM_ID
+    cmd: grep -RInE "DEVELOPMENT_TEAM|TEAM_ID|CODE_SIGN_IDENTITY" {{repo_root}}/external/build_configuration+/ 2>/dev/null | head -20
+    expect: "definitions found"
+    severity: info
+
+  # ---------------------------------------------------------------
+  # 6. Bazel / build environment
+  # ---------------------------------------------------------------
+  - id: bazel_binary
+    desc: Bazel wrapper present at expected path
+    cmd: ls -la {{repo_root}}/build-input/bazel-8.4.2-darwin-arm64
+    expect: "executable"
+    severity: warn
+
+  - id: bazel_cache_dir
+    desc: Bazel output_user_root exists
+    cmd: ls -la {{bazel_output_root}}/ 2>&1
+    expect: "directory exists"
+    severity: info
+
+  - id: stale_bazel_processes
+    desc: Any stale bazel/process-and-sign processes
+    cmd: pgrep -fl "bazel|process-and-sign" 2>&1 || echo "none"
+    expect: "none running"
+    severity: warn
+
+  # ---------------------------------------------------------------
+  # 7. The specific failing target
+  # ---------------------------------------------------------------
+  - id: widget_extension_target
+    desc: WidgetExtension target declared in BUILD
+    cmd: grep -n "WidgetExtension" {{repo_root}}/Telegram/BUILD | head -20
+    expect: "target found"
+    severity: info
+
+  - id: process_and_sign_script
+    desc: Locate the generated process-and-sign script
+    cmd: find {{bazel_output_root}} -name "process-and-sign--*.sh" 2>/dev/null | head -5
+    expect: "found at least one"
+    severity: info
+
+  - id: last_build_log
+    desc: Tail of most recent bazel build log (if present)
+    cmd: find {{bazel_output_root}} -name "command.log" -exec tail -n 40 {} \; 2>/dev/null
+    expect: "non-empty"
+    severity: info
+
+  # ---------------------------------------------------------------
+  # 8. Compare identities vs the shipped profile
+  # ---------------------------------------------------------------
+  - id: identity_match_check
+    desc: >
+      Cross-check: for each codesigning identity SHA1, is it inside the
+      Widget.mobileprovision DeveloperCertificates list?
+    cmd: |
+      PROFILE={{repo_root}}/{{provisioning_dir}}/Widget.mobileprovision
+      security cms -D -i "$PROFILE" \
+        | plutil -extract DeveloperCertificates raw - \
+        | base64 -D 2>/dev/null \
+        | openssl x509 -noout -fingerprint -sha1 2>/dev/null \
+        | while read -r line; do
+            hash=$(echo "$line" | awk -F= '{print $2}' | tr -d ':')
+            security find-identity -v -p codesigning | grep -q "$hash" \
+              && echo "MATCH: $hash" \
+              || echo "NO MATCH: $hash"
+          done
+    expect: "at least one MATCH"
+    severity: critical
+    hints:
+      - "If all are NO MATCH: your cert is not in the shipped profile."
+      - "Fix: either use a profile tied to your Apple team, or build the simulator with signing disabled."
