@@ -1,13 +1,13 @@
-name: Test certs against profiles
+name: Fix profiles with Public.cer
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  test:
+  fix:
     runs-on: macos-latest
 
     steps:
@@ -16,163 +16,94 @@ jobs:
           submodules: 'recursive'
           fetch-depth: '0'
 
-      - name: Import fake certificates into keychain
+      - name: Inject Public.cer into all profiles
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
-          python3 build-system/Make/ImportCertificates.py \
-            --path build-system/fake-codesigning/certs
 
-      - name: Show keychain identities
-        run: |
-          set -euo pipefail
-          echo "=== security find-identity -v -p codesigning ==="
-          security find-identity -v -p codesigning || true
-
-          echo
-          echo "=== all identities ==="
-          security find-identity -v || true
-
-          echo
-          echo "=== keychains ==="
-          security list-keychains || true
-
-      - name: Show cert in Public.cer
-        run: |
-          set -euo pipefail
-          CERT="build-system/fake-codesigning/certs/Public.cer"
-
-          echo "=== Public.cer (DER) ==="
-          openssl x509 -inform DER -in "$CERT" -noout -subject -issuer -serial -fingerprint -sha256 || true
-
-          echo
-          echo "=== Public.cer sha256 of DER bytes ==="
-          shasum -a 256 "$CERT"
-
-      - name: Extract and show cert from SelfSigned.p12
-        run: |
-          set -euo pipefail
-          P12="build-system/fake-codesigning/certs/SelfSigned.p12"
+          PROF_DIR="build-system/fake-codesigning/profiles"
+          CERT_DER="build-system/fake-codesigning/certs/Public.cer"
           WORK="$(mktemp -d)"
           trap 'rm -rf "$WORK"' EXIT
 
-          echo "=== try empty password ==="
-          openssl pkcs12 -in "$P12" -nokeys -clcerts -passin pass: \
-            -outform DER -out "$WORK/cert.der" 2>&1 || true
+          # Fresh signer for CMS wrap.
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$WORK/key.pem" -out "$WORK/signer.pem" \
+            -days 3650 -subj "/CN=Fake Provisioning" 2>/dev/null
 
-          if [ ! -s "$WORK/cert.der" ]; then
-            echo
-            echo "=== try legacy + empty ==="
-            openssl pkcs12 -in "$P12" -nokeys -clcerts -legacy -passin pass: \
-              -outform DER -out "$WORK/cert.der" 2>&1 || true
-          fi
+          for f in "$PROF_DIR"/*.mobileprovision; do
+            echo "=== $f"
 
-          if [ -s "$WORK/cert.der" ]; then
-            echo
-            echo "=== p12 cert info ==="
-            openssl x509 -inform DER -in "$WORK/cert.der" -noout -subject -issuer -serial -fingerprint -sha256
-            echo
-            echo "=== p12 cert sha256 of DER bytes ==="
-            shasum -a 256 "$WORK/cert.der"
-          else
-            echo "Could not extract cert from p12 with empty password (even with -legacy)."
-          fi
+            security cms -D -i "$f" > "$WORK/payload.plist"
 
-      - name: Compare certs against each profile
+            python3 - "$WORK/payload.plist" "$CERT_DER" <<'PY'
+          import plistlib, sys
+          plist_path, der_path = sys.argv[1], sys.argv[2]
+          p = plistlib.load(open(plist_path, "rb"))
+          p["DeveloperCertificates"] = [open(der_path, "rb").read()]
+          plistlib.dump(p, open(plist_path, "wb"))
+          print("  expiry =", p.get("ExpirationDate"))
+          PY
+
+            openssl smime -sign \
+              -signer "$WORK/signer.pem" \
+              -inkey  "$WORK/key.pem" \
+              -certfile "$WORK/signer.pem" \
+              -in "$WORK/payload.plist" \
+              -outform der -nodetach \
+              -out "$WORK/new.prof"
+
+            openssl smime -verify -noverify -inform der -in "$WORK/new.prof" >/dev/null
+            mv "$WORK/new.prof" "$f"
+          done
+
+      - name: Verify what we just wrote
         run: |
           set -euo pipefail
           PROF_DIR="build-system/fake-codesigning/profiles"
           PUB="build-system/fake-codesigning/certs/Public.cer"
           PUB_SHA="$(shasum -a 256 "$PUB" | awk '{print $1}')"
-
-          echo "Public.cer sha256: $PUB_SHA"
-          echo
-
-          for f in "$PROF_DIR"/*.mobileprovision; do
-            echo "========================================"
-            echo "FILE: $f"
-
-            DECODED="$(security cms -D -i "$f" 2>/dev/null || true)"
-            if [ -z "$DECODED" ]; then
-              echo "  STATUS: cannot decode"
-              continue
-            fi
-
-            EXP="$(printf '%s' "$DECODED" | grep -A1 '<key>ExpirationDate</key>' | grep '<date>' | sed -E 's/.*<date>(.*)<\/date>.*/\1/' || true)"
-            NAME="$(printf '%s' "$DECODED" | grep -A1 '<key>Name</key>' | grep '<string>' | sed -E 's/.*<string>(.*)<\/string>.*/\1/' || true)"
-
-            echo "  Name:           $NAME"
-            echo "  ExpirationDate: $EXP"
-
-            # Decode the embedded DeveloperCertificates array to DER, hash it.
-            TMP="$(mktemp -d)"
-            python3 - "$f" "$TMP" <<'PY' || true
-          import plistlib, sys, base64, subprocess, hashlib, os
-          prof_path, out_dir = sys.argv[1], sys.argv[2]
-          raw = subprocess.check_output(["security", "cms", "-D", "-i", prof_path])
-          p = plistlib.loads(raw)
-          certs = p.get("DeveloperCertificates", [])
-          print(f"  DeveloperCertificates count: {len(certs)}")
-          for i, c in enumerate(certs):
-              data = bytes(c)
-              sha = hashlib.sha256(data).hexdigest()
-              print(f"    [{i}] sha256(DER): {sha}  size={len(data)}")
-              with open(os.path.join(out_dir, f"cert_{i}.der"), "wb") as fh:
-                  fh.write(data)
-          PY
-
-            for cert in "$TMP"/cert_*.der; do
-              [ -f "$cert" ] || continue
-              echo "    subject: $(openssl x509 -inform DER -in "$cert" -noout -subject 2>/dev/null || echo '?')"
-              echo "    issuer:  $(openssl x509 -inform DER -in "$cert" -noout -issuer 2>/dev/null || echo '?')"
-            done
-
-            rm -rf "$TMP"
-          done
-
-      - name: Verify each profile would be accepted by codesigningtool
-        run: |
-          set -euo pipefail
-          # What codesigningtool does: it reads DeveloperCertificates from the
-          # profile and matches their fingerprint against codesigning identities
-          # in the keychain. Simulate the match here.
-          PROF_DIR="build-system/fake-codesigning/profiles"
-
-          echo "=== keychain codesigning identities (sha1) ==="
-          security find-identity -v -p codesigning | awk '/[0-9A-F]{40}/ {print $2}' > /tmp/kid_hashes.txt || true
-          cat /tmp/kid_hashes.txt || true
+          echo "Public.cer sha256 = $PUB_SHA"
           echo
 
           for f in "$PROF_DIR"/*.mobileprovision; do
             echo "=== $f"
-
             TMP="$(mktemp -d)"
-            python3 - "$f" "$TMP" <<'PY' || true
-          import plistlib, sys, subprocess, os, hashlib
-          prof_path, out_dir = sys.argv[1], sys.argv[2]
-          raw = subprocess.check_output(["security", "cms", "-D", "-i", prof_path])
+            python3 - "$f" "$TMP" <<'PY'
+          import plistlib, subprocess, sys, os, hashlib
+          raw = subprocess.check_output(["security", "cms", "-D", "-i", sys.argv[1]])
           p = plistlib.loads(raw)
-          for i, c in enumerate(p.get("DeveloperCertificates", [])):
-              with open(os.path.join(out_dir, f"cert_{i}.pem"), "wb") as fh:
-                  # write DER; openssl can handle it below
-                  fh.write(bytes(c))
+          certs = p.get("DeveloperCertificates", [])
+          print(f"  count={len(certs)}")
+          for c in certs:
+              print("  sha256:", hashlib.sha256(bytes(c)).hexdigest())
           PY
-
-            MATCHED=0
-            for cert in "$TMP"/cert_*.pem; do
-              [ -f "$cert" ] || continue
-              FP="$(openssl x509 -inform DER -in "$cert" -noout -fingerprint -sha1 2>/dev/null \
-                    | sed 's/.*=//' | tr -d ':' | tr 'a-f' 'A-F' || true)"
-              echo "  cert sha1: $FP"
-              if grep -q "^$FP$" /tmp/kid_hashes.txt 2>/dev/null; then
-                echo "    -> MATCHED in keychain"
-                MATCHED=1
-              fi
-            done
-
-            if [ "$MATCHED" = "0" ]; then
-              echo "  ::error::$f has NO matching identity in the keychain"
-            fi
-
             rm -rf "$TMP"
           done
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add build-system/fake-codesigning/profiles/
+          git commit -m "Inject fake cert into all provisioning profiles" || echo "nothing to commit"
+          git push
+
+      - name: Verify after commit
+        run: |
+          set -euo pipefail
+          git fetch origin
+          git show HEAD:build-system/fake-codesigning/profiles/Intents.mobileprovision \
+            > /tmp/intents.prof
+
+          TMP="$(mktemp -d)"
+          python3 - /tmp/intents.prof "$TMP" <<'PY'
+          import plistlib, subprocess, sys, hashlib
+          raw = subprocess.check_output(["security", "cms", "-D", "-i", sys.argv[1]])
+          p = plistlib.loads(raw)
+          certs = p.get("DeveloperCertificates", [])
+          print(f"Intents.mobileprovision committed cert count = {len(certs)}")
+          for c in certs:
+              print("sha256:", hashlib.sha256(bytes(c)).hexdigest())
+          PY
+          rm -rf "$TMP"
