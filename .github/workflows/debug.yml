@@ -1,13 +1,13 @@
-name: Inject fake cert into all profiles
+name: Debug Make.py Help
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  fix:
+  debug:
     runs-on: macos-latest
 
     steps:
@@ -16,53 +16,54 @@ jobs:
           submodules: 'recursive'
           fetch-depth: '0'
 
-      - name: Inject cert into every profile
+      - name: Set active Xcode path
         run: |
           set -euo pipefail
+          XCODE_VERSION=$(python3 -c '
+          import json
+          with open("versions.json") as f:
+              print(json.load(f)["xcode"])
+          ')
+          echo "Using Xcode $XCODE_VERSION"
+          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          xcodebuild -version
 
-          PROF_DIR="build-system/fake-codesigning/profiles"
-          CERT_DER="build-system/fake-codesigning/certs/Public.cer"
-          WORK="$(mktemp -d)"
-          trap 'rm -rf "$WORK"' EXIT
-
-          # Self-signed cert used only to wrap the plist as CMS.
-          openssl req -x509 -newkey rsa:2048 -nodes \
-            -keyout "$WORK/key.pem" -out "$WORK/signer.pem" \
-            -days 3650 -subj "/CN=Fake Provisioning" 2>/dev/null
-
-          for f in "$PROF_DIR"/*.mobileprovision; do
-            echo "=== $f"
-            security cms -D -i "$f" > "$WORK/payload.plist"
-
-            python3 - "$WORK/payload.plist" "$CERT_DER" <<'PY'
-          import plistlib, sys
-          p = plistlib.load(open(sys.argv[1], "rb"))
-          p["DeveloperCertificates"] = [open(sys.argv[2], "rb").read()]
-          plistlib.dump(p, open(sys.argv[1], "wb"))
-          print("  expiry:", p.get("ExpirationDate"), "| certs:", len(p["DeveloperCertificates"]))
-          PY
-
-            openssl smime -sign \
-              -signer "$WORK/signer.pem" \
-              -inkey  "$WORK/key.pem" \
-              -certfile "$WORK/signer.pem" \
-              -in "$WORK/payload.plist" \
-              -outform der -nodetach \
-              -out "$WORK/new.prof"
-
-            openssl smime -verify -noverify -inform der -in "$WORK/new.prof" >/dev/null
-            DECODED="$(security cms -D -i "$WORK/new.prof")"
-            echo "$DECODED" | grep -q "DeveloperCertificates" || { echo "::error::missing DeveloperCertificates"; exit 1; }
-            echo "$DECODED" | grep -q "<date>" || { echo "::error::missing date"; exit 1; }
-
-            mv "$WORK/new.prof" "$f"
-          done
-
-      - name: Commit
+      - name: Show Make.py build help
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add build-system/fake-codesigning/profiles/
-          git commit -m "Inject fake cert into all provisioning profiles"
-          git push
+          cd "$GITHUB_WORKSPACE"
+          python3 build-system/Make/Make.py build --help 2>&1
+
+      - name: Show Make.py help (general)
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          python3 build-system/Make/Make.py --help 2>&1
+
+      - name: Inspect Make.py source for codesigning flags
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          echo "=== Grep for disable/skip/signing keywords ==="
+          grep -in "disable\|skip\|sign" build-system/Make/Make.py | head -50 || echo "No matches"
+
+      - name: Check appstore-configuration.json structure
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          if [ -f "build-system/appstore-configuration.json" ]; then
+            echo "=== Found existing config ==="
+            cat build-system/appstore-configuration.json | python3 -m json.tool
+          else
+            echo "No config file yet"
+          fi
+
+      - name: List Build environment files
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          echo "=== Build system structure ==="
+          find build-system/Make -type f -name "*.py" | head -20
+          echo ""
+          echo "=== Build system argument parsing ==="
+          grep -n "argparse\|add_argument" build-system/Make/Make.py | head -30 || true
