@@ -1,4 +1,4 @@
-name: Inject fake cert into profiles
+name: Inject fake cert into all profiles
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ jobs:
           submodules: 'recursive'
           fetch-depth: '0'
 
-      - name: Inject Public.cer into every profile
+      - name: Inject cert into every profile
         run: |
           set -euo pipefail
 
@@ -32,16 +32,14 @@ jobs:
 
           for f in "$PROF_DIR"/*.mobileprovision; do
             echo "=== $f"
-
             security cms -D -i "$f" > "$WORK/payload.plist"
 
             python3 - "$WORK/payload.plist" "$CERT_DER" <<'PY'
           import plistlib, sys
-          plist_path, der_path = sys.argv[1], sys.argv[2]
-          p = plistlib.load(open(plist_path, "rb"))
-          p["DeveloperCertificates"] = [open(der_path, "rb").read()]
-          plistlib.dump(p, open(plist_path, "wb"))
-          print("  injected cert, expiry =", p.get("ExpirationDate"))
+          p = plistlib.load(open(sys.argv[1], "rb"))
+          p["DeveloperCertificates"] = [open(sys.argv[2], "rb").read()]
+          plistlib.dump(p, open(sys.argv[1], "wb"))
+          print("  expiry:", p.get("ExpirationDate"), "| certs:", len(p["DeveloperCertificates"]))
           PY
 
             openssl smime -sign \
@@ -53,12 +51,9 @@ jobs:
               -out "$WORK/new.prof"
 
             openssl smime -verify -noverify -inform der -in "$WORK/new.prof" >/dev/null
-
             DECODED="$(security cms -D -i "$WORK/new.prof")"
-            echo "$DECODED" | grep -q "DeveloperCertificates" \
-              || { echo "::error::DeveloperCertificates missing"; exit 1; }
-            echo "$DECODED" | grep -q "<date>" \
-              || { echo "::error::no date"; exit 1; }
+            echo "$DECODED" | grep -q "DeveloperCertificates" || { echo "::error::missing DeveloperCertificates"; exit 1; }
+            echo "$DECODED" | grep -q "<date>" || { echo "::error::missing date"; exit 1; }
 
             mv "$WORK/new.prof" "$f"
           done
@@ -69,5 +64,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add build-system/fake-codesigning/profiles/
-          git commit -m "Inject fake cert into DeveloperCertificates of all provisioning profiles"
+          git commit -m "Inject fake cert into all provisioning profiles"
           git push
