@@ -8,10 +8,6 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: macos-latest
@@ -24,21 +20,14 @@ jobs:
 
       - name: Set active Xcode path
         run: |
-          set -euo pipefail
-          XCODE_VERSION=$(python3 -c '
-          import json
-          with open("versions.json") as f:
-              print(json.load(f)["xcode"])
-          ')
-          echo "Using Xcode $XCODE_VERSION"
-          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
-          xcodebuild -version
+          XCODE_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["xcode"]);')
+          sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer
 
       - name: Cache Bazel Build Directory
         uses: actions/cache@v4
         with:
           path: /private/var/tmp/_bazel_containerhost
-          key: bazel-cache-${{ runner.os }}-${{ hashFiles('**/BUILD', '**/BUILD.bazel', 'WORKSPACE', 'WORKSPACE.bazel', 'MODULE.bazel', 'MODULE.bazel.lock', 'versions.json') }}
+          key: bazel-cache-${{ runner.os }}-${{ hashFiles('**/BUILD', '**/BUILD.bazel', 'WORKSPACE', 'versions.json') }}
           restore-keys: |
             bazel-cache-${{ runner.os }}-
 
@@ -48,16 +37,53 @@ jobs:
           path: /tmp/bazel-bin-cache
           key: bazel-binary-${{ runner.os }}-${{ hashFiles('versions.json') }}
 
-      - name: Create canonical source directory
+      - name: Download Bazel
         run: |
           set -euo pipefail
+
+          mkdir -p /tmp/bazel-bin-cache
+          RAW_BAZEL_FIELD=$(cat versions.json | python3 -c 'import json,sys;print(json.load(sys.stdin)["bazel"])')
+          BAZEL_VERSION="${RAW_BAZEL_FIELD%%:*}"   # strip off the ":sha256..." suffix
+          ASSET="bazel-${BAZEL_VERSION}-darwin-arm64"
+          BAZEL_PATH="/tmp/bazel-bin-cache/${ASSET}"
+
+          if [ -x "$BAZEL_PATH" ] && "$BAZEL_PATH" --version >/dev/null 2>&1; then
+            echo "Using cached Bazel $BAZEL_VERSION"
+          else
+            echo "Downloading Bazel $BAZEL_VERSION"
+            curl -L --retry 5 --retry-all-errors --fail \
+              -o "$BAZEL_PATH" \
+              "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/${ASSET}"
+
+            # Verify against Bazel's own published checksum for this asset,
+            # NOT the (incorrect, x86_64) hash recorded in versions.json.
+            curl -L --retry 5 --retry-all-errors --fail \
+              -o "${BAZEL_PATH}.sha256" \
+              "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/${ASSET}.sha256"
+
+            EXPECTED=$(awk '{print $1}' "${BAZEL_PATH}.sha256")
+            ACTUAL=$(shasum -a 256 "$BAZEL_PATH" | awk '{print $1}')
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "Checksum mismatch for $ASSET: expected $EXPECTED, got $ACTUAL"
+              rm -f "$BAZEL_PATH"
+              exit 1
+            fi
+
+            chmod +x "$BAZEL_PATH"
+            "$BAZEL_PATH" --version
+          fi
+
+          echo "BAZEL_BIN=$BAZEL_PATH" >> $GITHUB_ENV
+
+      - name: Create canonical source directory
+        run: |
+          set -x
           sudo mkdir -p /Users/Shared
-          rm -rf /Users/Shared/telegram-ios
-          cp -R "$GITHUB_WORKSPACE" /Users/Shared/telegram-ios
+          cp -R $GITHUB_WORKSPACE /Users/Shared/
+          mv /Users/Shared/$(basename $GITHUB_WORKSPACE) /Users/Shared/telegram-ios
 
       - name: Setup Minimal Configuration
         run: |
-          set -euo pipefail
           cd /Users/Shared/telegram-ios
           cat << 'EOF' > build-system/appstore-configuration.json
           {
@@ -76,114 +102,28 @@ jobs:
           }
           EOF
 
-      - name: Verify profiles have fake cert (sanity check)
+      - name: Build the App for KSign
         run: |
-          set -euo pipefail
-          cd /Users/Shared/telegram-ios
-          PUB="build-system/fake-codesigning/certs/Public.cer"
-          PUB_SHA="$(shasum -a 256 "$PUB" | awk '{print $1}')"
-          echo "Public.cer sha256 = $PUB_SHA"
-          FAIL=0
-          for f in build-system/fake-codesigning/profiles/*.mobileprovision; do
-            DECODED="$(security cms -D -i "$f" 2>/dev/null || true)"
-            COUNT=$(printf '%s' "$DECODED" | grep -c '<key>DeveloperCertificates</key>' || true)
-            echo "$f  DeveloperCertificates=$COUNT"
-            if [ "$COUNT" -lt 1 ]; then
-              echo "::error::$f missing DeveloperCertificates"
-              FAIL=1
-            fi
-          done
-          if [ "$FAIL" = "1" ]; then exit 1; fi
-
-      - name: Pre-download Bazel Binary with Retry
-        run: |
-          set -euo pipefail
-          BAZEL_VERSION="8.4.2"
-          BAZEL_DIR="/tmp/bazel-bin-cache"
-          mkdir -p "$BAZEL_DIR"
-          if [ ! -f "$BAZEL_DIR/bazel" ]; then
-            echo "Downloading Bazel $BAZEL_VERSION..."
-            curl --retry 10 --retry-delay 5 --retry-max-time 120 --connect-timeout 15 \
-              -sSL "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-darwin-arm64" \
-              -o "$BAZEL_DIR/bazel"
-            chmod +x "$BAZEL_DIR/bazel"
-          fi
-          echo "BAZEL_BIN=$BAZEL_DIR/bazel" >> "$GITHUB_ENV"
-
-      - name: Prepare unsigned build
-        run: |
-          set -euo pipefail
-          cd /Users/Shared/telegram-ios
-
-          rm -rf build-input
-
-          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
-
-          APP_VERSION=$(python3 -c '
-          import json
-          with open("versions.json") as f:
-              print(json.load(f)["app"])
-          ')
-
-          COMMIT_COUNT="$(git rev-list --count HEAD)"
-          BUILD_NUMBER="$((COMMIT_COUNT + BUILD_NUMBER_OFFSET))"
-
-          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
-          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
-          echo "APP_VERSION=$APP_VERSION"
-          echo "BUILD_NUMBER=$BUILD_NUMBER"
-
-      - name: Nuke cached build_configuration+ from Bazel output root
-        run: |
-          set -euo pipefail
-          BAZEL_ROOT="/private/var/tmp/_bazel_containerhost"
-          echo "Removing cached build_configuration+ repos from $BAZEL_ROOT..."
-          find "$BAZEL_ROOT" -maxdepth 3 -type d -name "build_configuration+" -print -exec rm -rf {} + 2>/dev/null || true
-          find "$BAZEL_ROOT" -maxdepth 3 -type d -name "build_configuration+*" -print -exec rm -rf {} + 2>/dev/null || true
-          echo "Done."
-
-      - name: Verify fake codesigning data
-        run: |
-          set -euo pipefail
-          cd /Users/Shared/telegram-ios
-          if [ ! -d "build-system/fake-codesigning" ]; then
-            echo "ERROR: build-system/fake-codesigning not found."
-            exit 1
-          fi
-          ls -la build-system/fake-codesigning
-
-      - name: Import fake certificates
-        run: |
-          set -euo pipefail
-          cd /Users/Shared/telegram-ios
-          python3 build-system/Make/ImportCertificates.py \
-            --path build-system/fake-codesigning/certs
-
-      - name: Debug Make.py config source
-        run: |
-          set -euo pipefail
-          cd /Users/Shared/telegram-ios
-
-          echo "=== source tree profiles ==="
-          ls -la build-system/fake-codesigning/profiles/ | head
-
-          echo
-          echo "=== existing build-input ==="
-          ls -la build-input/ 2>/dev/null || echo "no build-input"
-
-          echo
-          echo "=== Make.py references to provisioning / fake-codesigning ==="
-          grep -rn "provisioning\|fake-codesigning\|configuration-repository" \
-            build-system/Make/*.py 2>/dev/null | head -50 || true
-
-      - name: Build unsigned IPA
-        run: |
-          set -euo pipefail
+          set -x
 
           SOURCE_DIR=/Users/Shared/telegram-ios
           BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
 
-          cd "$SOURCE_DIR"
+          cd $SOURCE_DIR
+
+          # Ensure build-input is completely clean so Bazel redownloads properly
+          rm -rf build-input
+
+          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
+
+          export APP_VERSION=$(cat versions.json | python3 -c 'import json,sys;obj=json.load(sys.stdin);print(obj["app"]);')
+          export COMMIT_COUNT=$(git rev-list --count HEAD)
+          export COMMIT_COUNT="$(($COMMIT_COUNT+$BUILD_NUMBER_OFFSET))"
+          export BUILD_NUMBER="$COMMIT_COUNT"
+          echo "BUILD_NUMBER=$(echo $BUILD_NUMBER)" >> $GITHUB_ENV
+          echo "APP_VERSION=$(echo $APP_VERSION)" >> $GITHUB_ENV
+
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
 
           python3 -u build-system/Make/Make.py \
             --bazelUserRoot="$BAZEL_USER_ROOT" \
@@ -198,83 +138,19 @@ jobs:
           rm -rf "$OUTPUT_PATH"
           mkdir -p "$OUTPUT_PATH"
 
-          IPA_PATH=""
           if [ -f "bazel-bin/Telegram/Telegram.ipa" ]; then
-            IPA_PATH="bazel-bin/Telegram/Telegram.ipa"
+            cp "bazel-bin/Telegram/Telegram.ipa" "$OUTPUT_PATH/"
           else
-            IPA_PATH=$(find bazel-out -path '*/bin/Telegram/Telegram.ipa' -type f -print -quit || true)
+            cp bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa "$OUTPUT_PATH/"
           fi
 
-          if [ -z "$IPA_PATH" ] || [ ! -f "$IPA_PATH" ]; then
-            echo "ERROR: Telegram.ipa was not produced."
-            exit 1
-          fi
-
-          echo "Found IPA: $IPA_PATH"
-          cp "$IPA_PATH" "$OUTPUT_PATH/Telegram.ipa"
-          ls -lh "$OUTPUT_PATH/Telegram.ipa"
-
-      - name: Strip signing and provisioning data
-        run: |
-          set -euo pipefail
-          cd /Users/Shared/telegram-ios
-
-          IPA="$PWD/build/artifacts/Telegram.ipa"
-          TEMP_DIR="$(mktemp -d)"
-          OUTPUT_DIR="$PWD/build/artifacts"
-          trap 'rm -rf "$TEMP_DIR"' EXIT
-
-          unzip -q "$IPA" -d "$TEMP_DIR"
-
-          find "$TEMP_DIR/Payload" -type f -name "embedded.mobileprovision" -delete
-          find "$TEMP_DIR/Payload" -type d -name "_CodeSignature" -prune -exec rm -rf {} +
-          find "$TEMP_DIR/Payload" -type f -name "CodeResources" -delete
-
-          rm -f "$IPA"
-          cd "$TEMP_DIR"
-          zip -qry "$OUTPUT_DIR/Telegram.ipa" Payload
-
-          echo "Final unsigned IPA:"
-          ls -lh "$OUTPUT_DIR/Telegram.ipa"
-
-          if unzip -l "$OUTPUT_DIR/Telegram.ipa" | grep -q "embedded.mobileprovision"; then
-            echo "::error::embedded.mobileprovision still present!"
-            exit 1
-          fi
-          if unzip -l "$OUTPUT_DIR/Telegram.ipa" | grep -q "_CodeSignature/"; then
-            echo "::error::_CodeSignature still present!"
-            exit 1
-          fi
-          echo "IPA is ready for KSign."
-
-      - name: Collect DSYMs
-        run: |
-          set -euo pipefail
-          cd /Users/Shared/telegram-ios
-          OUTPUT_PATH="build/artifacts"
           mkdir -p build/DSYMs
-
           if [ -d "bazel-bin/Telegram/Telegram.app.dSYM" ]; then
             cp -R bazel-bin/Telegram/*.dSYM build/DSYMs/ 2>/dev/null || true
           else
-            find bazel-out -path '*/bin/Telegram/*.dSYM' -type d \
-              -exec cp -R {} build/DSYMs/ \; 2>/dev/null || true
+            cp -R bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/*.dSYM build/DSYMs/ 2>/dev/null || true
           fi
-
-          rm -f "$OUTPUT_PATH/Telegram.DSYMs.zip"
-          cd build
-          zip -qr "../$OUTPUT_PATH/Telegram.DSYMs.zip" DSYMs
-          cd ..
-          ls -lh "$OUTPUT_PATH/Telegram.DSYMs.zip"
-
-      - name: Upload IPA and DSYMs as workflow artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: Telegram-${{ env.APP_VERSION }}-${{ env.BUILD_NUMBER }}-unsigned
-          path: |
-            /Users/Shared/telegram-ios/build/artifacts/Telegram.ipa
-            /Users/Shared/telegram-ios/build/artifacts/Telegram.DSYMs.zip
-          if-no-files-found: error
+          zip -r "./$OUTPUT_PATH/Telegram.DSYMs.zip" build/DSYMs 1>/dev/null
 
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
@@ -282,15 +158,7 @@ jobs:
           tag_name: build-${{ env.BUILD_NUMBER }}
           name: Telegram ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }}) - KSign Ready
           body: |
-            Unsigned Telegram iOS ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }}).
-
-            This IPA contains:
-            - No provisioning profiles
-            - No _CodeSignature directories
-            - arm64 device binaries
-            - DSYMs
-
-            The IPA is intended to be signed separately with KSign.
+            Build of Telegram for iOS ${{ env.APP_VERSION }} (${{ env.BUILD_NUMBER }}) optimized for KSign.
           draft: false
           prerelease: false
           files: |
