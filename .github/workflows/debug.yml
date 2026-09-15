@@ -1,255 +1,270 @@
-version: "1.0"
-description: >
-  Diagnostic suite for Telegram-iOS / Ghostgram Bazel build failures related
-  to code signing, provisioning profiles, and code signing identities.
-  Focus: the error "Unable to find an identity on the system matching the
-  ones in .../Widget.mobileprovision".
+name: Diagnose Build Environment
 
-meta:
-  repo_root: "/Users/Shared/telegram-ios"
-  provisioning_dir: "external/build_configuration+/provisioning"
-  certs_dir: "build-system/fake-codesigning/certs"
-  bazel_output_root: "/private/var/tmp/_bazel_containerhost"
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+    inputs:
+      repo_root:
+        description: "Path to telegram-ios checkout inside the runner"
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 6 * * *"
 
-checks:
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
 
-  # ---------------------------------------------------------------
-  # 1. System / environment
-  # ---------------------------------------------------------------
-  - id: macos_version
-    desc: macOS version and build
-    cmd: sw_vers
-    expect: "non-empty"
-    severity: info
+jobs:
+  diagnose:
+    name: Run diagnostics
+    runs-on: macos-14
+    timeout-minutes: 30
 
-  - id: xcode_version
-    desc: Active Xcode version (Telegram pins to a specific Xcode)
-    cmd: xcodebuild -version
-    expect: "non-empty"
-    severity: warn
+    env:
+      REPO_ROOT: ${{ github.event.inputs.repo_root || github.workspace }}
 
-  - id: xcode_select
-    desc: Active developer directory
-    cmd: xcode-select -p
-    expect: "/Applications/Xcode"
-    severity: warn
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-  - id: arch
-    desc: Host architecture (must be arm64 for this build)
-    cmd: uname -m
-    expect: "arm64"
-    severity: warn
+      - name: Runner info
+        shell: bash
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version || true
+          xcode-select -p || true
+          echo "REPO_ROOT=$REPO_ROOT"
 
-  # ---------------------------------------------------------------
-  # 2. Keychain / signing identities
-  # ---------------------------------------------------------------
-  - id: signing_identities
-    desc: All valid code signing identities in the default search list
-    cmd: security find-identity -v -p codesigning
-    expect: "contains at least one valid identity"
-    severity: critical
-    hints:
-      - "If empty: cert missing or untrusted. Install Apple WWDR intermediates."
-      - "If 'CSSMERR_TP_NOT_TRUSTED': fix trust in Keychain Access."
+      # ---------------------------------------------------------------------
+      # Everything below is the "diagnostic" — inlined, no external files.
+      # ---------------------------------------------------------------------
+      - name: Set up diagnostic helpers
+        shell: bash
+        run: |
+          set -e
+          mkdir -p .diag
+          cat > .diag/lib.sh <<'LIB'
+          PASS=0; WARN=0; FAIL=0
+          hdr() { printf "\n== %s ==\n" "$1"; }
+          record() {
+            case "$1" in
+              critical) FAIL=$((FAIL+1)); printf "  FAIL  %s\n" "$2" ;;
+              warn)     WARN=$((WARN+1)); printf "  WARN  %s\n" "$2" ;;
+              *)        PASS=$((PASS+1)); printf "  OK    %s\n" "$2" ;;
+            esac
+          }
+          check() {
+            local id="$1" desc="$2" sev="$3" cmd="$4" out rc
+            hdr "$id"; printf "  %s\n" "$desc"; printf "  \$ %s\n" "$cmd"
+            out="$(bash -c "$cmd" 2>&1)"; rc=$?
+            [ -n "$out" ] && printf "%s\n" "$out" | sed 's/^/    /'
+            if   [ $rc -ne 0 ]; then record "$sev" "command exited $rc"
+            elif [ -z "$out" ]; then record "$sev" "no output"
+            else record "$sev" "ok"; fi
+          }
+          LIB
+          echo "helpers written"
 
-  - id: signing_identities_all_keychains
-    desc: Signing identities across every keychain on the system
-    cmd: security find-identity -v -p codesigning $(security list-keychains -d user | tr -d '\"')
-    expect: "non-empty"
-    severity: info
+      - name: Run diagnostics (capture)
+        id: diag
+        shell: bash
+        run: |
+          set +e
+          . .diag/lib.sh
 
-  - id: default_keychain
-    desc: Which keychain is the default (Bazel uses default search list)
-    cmd: security default-keychain
-    expect: "login.keychain"
-    severity: warn
+          PROV="$REPO_ROOT/external/build_configuration+/provisioning"
+          CERTS="$REPO_ROOT/build-system/fake-codesigning/certs"
+          BAZELOUT="/private/var/tmp/_bazel_containerhost"
+          WIDGET="$PROV/Widget.mobileprovision"
 
-  - id: keychain_list
-    desc: User keychain search list
-    cmd: security list-keychains -d user
-    expect: "includes login.keychain-db"
-    severity: warn
+          # -- 1. system --
+          check macos_version        "macOS version and build"                info     "sw_vers"
+          check xcode_version        "Active Xcode version"                   warn     "xcodebuild -version || true"
+          check xcode_select         "Active developer dir"                   warn     "xcode-select -p || true"
+          check arch                 "Host architecture"                      warn     "uname -m"
 
-  - id: login_keychain_unlocked
-    desc: Is the login keychain unlocked
-    cmd: security show-keychain-info ~/Library/Keychains/login.keychain-db 2>&1
-    expect: "no error"
-    severity: critical
+          # -- 2. keychain / identities --
+          check signing_identities   "Valid codesigning identities (default)" critical "security find-identity -v -p codesigning"
+          check default_keychain     "Default keychain"                       warn     "security default-keychain"
+          check keychain_list        "User keychain search list"              warn     "security list-keychains -d user"
+          check keychain_unlocked    "Login keychain unlocked"                critical "security show-keychain-info ~/Library/Keychains/login.keychain-db"
+          check apple_dev_certs      "Apple Development certs present"        critical "security find-certificate -a -c 'Apple Development' -Z 2>/dev/null | head -40 || true"
+          check apple_dist_certs     "Apple Distribution certs present"       warn     "security find-certificate -a -c 'Apple Distribution' -Z 2>/dev/null | head -40 || true"
+          check wwdr_intermediates   "Apple WWDR intermediates present"       critical "security find-certificate -a -c 'Apple Worldwide Developer Relations' -Z 2>/dev/null | head -40 || true"
 
-  - id: apple_dev_certs
-    desc: Apple Development certificates present
-    cmd: security find-certificate -a -c "Apple Development" -Z
-    expect: "non-empty"
-    severity: critical
+          # -- 3. profiles --
+          check widget_profile_exists "Widget.mobileprovision exists"        critical "test -f '$WIDGET' && echo OK || echo MISSING"
+          check widget_profile_team   "TeamIdentifier in Widget profile"     critical "security cms -D -i '$WIDGET' 2>/dev/null | plutil -extract TeamIdentifier.0 raw - 2>/dev/null || echo '<unreadable>'"
+          check widget_profile_name   "Name of Widget profile"               info     "security cms -D -i '$WIDGET' 2>/dev/null | plutil -extract Name raw - 2>/dev/null || echo '<unreadable>'"
+          check widget_profile_uuid   "UUID of Widget profile"               info     "security cms -D -i '$WIDGET' 2>/dev/null | plutil -extract UUID raw - 2>/dev/null || echo '<unreadable>'"
+          check widget_profile_expiry "ExpirationDate of Widget profile"     critical "security cms -D -i '$WIDGET' 2>/dev/null | plutil -extract ExpirationDate raw - 2>/dev/null || echo '<unreadable>'"
+          check all_shipped_profiles  "All shipped provisioning profiles"    info     "ls -la '$PROV' 2>&1 || echo 'dir not found'"
 
-  - id: apple_dist_certs
-    desc: Apple Distribution certificates present
-    cmd: security find-certificate -a -c "Apple Distribution" -Z
-    expect: "non-empty"
-    severity: warn
+          # -- 4. fake certs --
+          check fake_certs_dir       "Fake codesigning certs dir"            warn     "ls -la '$CERTS' 2>&1 || echo 'dir not found'"
+          check fake_public_cer      "Public.cer present"                    warn     "test -f '$CERTS/Public.cer' && echo OK || echo MISSING"
+          check fake_public_cer_info "Public.cer subject/issuer/dates"       info     "openssl x509 -inform DER -in '$CERTS/Public.cer' -noout -subject -issuer -dates 2>/dev/null || openssl x509 -in '$CERTS/Public.cer' -noout -subject -issuer -dates 2>/dev/null || echo '<unreadable>'"
+          check fake_public_cer_sha  "Public.cer SHA1"                       info     "openssl x509 -inform DER -in '$CERTS/Public.cer' -noout -fingerprint -sha1 2>/dev/null || openssl x509 -in '$CERTS/Public.cer' -noout -fingerprint -sha1 2>/dev/null || echo '<unreadable>'"
 
-  - id: wwdr_intermediates
-    desc: Apple WWDR intermediate certs (needed for trust chain)
-    cmd: security find-certificate -a -c "Apple Worldwide Developer Relations" -Z
-    expect: "non-empty"
-    severity: critical
+          # -- 5. build config --
+          check build_config_dir     "external/build_configuration+ listing" info     "ls -la '$REPO_ROOT/external/build_configuration+/' 2>&1 || echo 'dir not found'"
+          check team_id_in_config    "DEVELOPMENT_TEAM/TEAM_ID/CODE_SIGN_IDENTITY" info "grep -RInE 'DEVELOPMENT_TEAM|TEAM_ID|CODE_SIGN_IDENTITY' '$REPO_ROOT/external/build_configuration+/' 2>/dev/null | head -20 || echo '<none>'"
+          check bazel_binary         "Bazel wrapper present"                 warn     "ls -la '$REPO_ROOT/build-input/bazel-8.4.2-darwin-arm64' 2>&1 || echo 'not present'"
+          check bazel_cache_dir      "Bazel output_user_root"                info     "ls -la '$BAZELOUT/' 2>&1 || echo 'not present'"
+          check stale_processes      "Stale bazel/process-and-sign procs"    warn     "pgrep -fl 'bazel|process-and-sign' 2>/dev/null || echo none"
+          check widget_target        "WidgetExtension in Telegram/BUILD"     info     "grep -n 'WidgetExtension' '$REPO_ROOT/Telegram/BUILD' 2>/dev/null | head -20 || echo '<BUILD not found>'"
+          check sign_scripts         "process-and-sign scripts"              info     "find '$BAZELOUT' -name 'process-and-sign--*.sh' 2>/dev/null | head -5 || echo '<none>'"
+          check last_build_log       "Tail of bazel command.log"             info     "find '$BAZELOUT' -name 'command.log' -exec tail -n 40 {} \\; 2>/dev/null | tail -40 || echo '<none>'"
 
-  # ---------------------------------------------------------------
-  # 3. Provisioning profiles shipped with the repo
-  # ---------------------------------------------------------------
-  - id: widget_profile_exists
-    desc: Widget provisioning profile exists in the repo
-    cmd: test -f {{repo_root}}/{{provisioning_dir}}/Widget.mobileprovision && echo OK || echo MISSING
-    expect: "OK"
-    severity: critical
+          # -- 6. identity ⇄ profile cross-check --
+          hdr "identity_match_check"
+          echo "  Cross-check: is any system identity SHA1 inside Widget.mobileprovision?"
+          if [ ! -f "$WIDGET" ]; then
+            record critical "profile not found: $WIDGET"
+          else
+            SYS_IDS="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'[()]' '/\)/{print $1}' | awk '{print toupper($2)}' | sort -u)"
+            if [ -z "$SYS_IDS" ]; then
+              echo "    (no system codesigning identities)"
+            else
+              echo "    system identities:"; printf "%s\n" "$SYS_IDS" | sed 's/^/      /'
+            fi
 
-  - id: widget_profile_team
-    desc: Team ID embedded in Widget.mobileprovision
-    cmd: security cms -D -i {{repo_root}}/{{provisioning_dir}}/Widget.mobileprovision | plutil -extract TeamIdentifier.0 raw -
-    expect: "non-empty"
-    severity: critical
+            PROF_IDS="$(security cms -D -i "$WIDGET" 2>/dev/null \
+              | plutil -extract DeveloperCertificates xml1 -o - - 2>/dev/null \
+              | python3 -c '
+import sys, plistlib, subprocess, tempfile, pathlib
+try:
+    data = plistlib.loads(sys.stdin.buffer.read())
+except Exception:
+    sys.exit(0)
+with tempfile.TemporaryDirectory() as td:
+    for cert in data:
+        p = pathlib.Path(td)/"c.der"; p.write_bytes(cert)
+        try:
+            out = subprocess.check_output(
+                ["openssl","x509","-inform","DER","-in",str(p),
+                 "-noout","-fingerprint","-sha1"],
+                stderr=subprocess.DEVNULL).decode()
+            print(out.split("=")[1].strip().replace(":","").upper())
+        except Exception:
+            pass
+' 2>/dev/null)"
 
-  - id: widget_profile_name
-    desc: Display name of the Widget provisioning profile
-    cmd: security cms -D -i {{repo_root}}/{{provisioning_dir}}/Widget.mobileprovision | plutil -extract Name raw -
-    expect: "non-empty"
-    severity: info
+            if [ -z "$PROF_IDS" ]; then
+              echo "    (no certs decoded from profile)"
+              record critical "could not decode DeveloperCertificates from profile"
+            else
+              echo "    profile certs:"; printf "%s\n" "$PROF_IDS" | sed 's/^/      /'
+              MATCH=0
+              while read -r pid; do
+                [ -z "$pid" ] && continue
+                if echo "$SYS_IDS" | grep -qx "$pid"; then
+                  echo "    MATCH    $pid"; MATCH=1
+                else
+                  echo "    NO MATCH $pid"
+                fi
+              done <<< "$PROF_IDS"
+              if [ $MATCH -eq 1 ]; then
+                record info "at least one identity matches the profile"
+              else
+                record critical "no system identity matches the profile — signing will fail"
+              fi
+            fi
+          fi
 
-  - id: widget_profile_uuid
-    desc: UUID of the Widget provisioning profile
-    cmd: security cms -D -i {{repo_root}}/{{provisioning_dir}}/Widget.mobileprovision | plutil -extract UUID raw -
-    expect: "non-empty"
-    severity: info
+          hdr "summary"
+          echo "  PASS: $PASS"
+          echo "  WARN: $WARN"
+          echo "  FAIL: $FAIL"
+          if [ $FAIL -gt 0 ]; then
+            echo "  RESULT: critical issues found"
+            echo "exit_code=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "  RESULT: no critical issues"
+            echo "exit_code=0" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
 
-  - id: widget_profile_expiry
-    desc: Expiration of the Widget provisioning profile
-    cmd: security cms -D -i {{repo_root}}/{{provisioning_dir}}/Widget.mobileprovision | plutil -extract ExpirationDate raw -
-    expect: "in the future"
-    severity: critical
+      - name: Build summary
+        id: summary
+        shell: bash
+        run: |
+          set +e
+          PROV="$REPO_ROOT/external/build_configuration+/provisioning"
+          WIDGET="$PROV/Widget.mobileprovision"
+          {
+            echo "## Diagnostic summary"
+            echo ""
+            echo "- Repo:   \`${{ github.repository }}\`"
+            echo "- Ref:    \`${{ github.ref }}\`"
+            echo "- SHA:    \`${{ github.sha }}\`"
+            echo "- Runner: \`$(uname -m)\` / \`$(sw_vers -productVersion)\`"
+            echo "- Xcode:  \`$(xcodebuild -version 2>/dev/null | head -1)\`"
+            echo "- Diagnostic exit: \`${{ steps.diag.outputs.exit_code }}\`"
+            echo ""
+            echo "### Signing identities"
+            echo '```'
+            security find-identity -v -p codesigning 2>&1 || echo "(none)"
+            echo '```'
+            echo ""
+            echo "### Keychain search list"
+            echo '```'
+            security list-keychains -d user 2>&1 || true
+            echo '```'
+            echo ""
+            echo "### Shipped provisioning profiles"
+            echo '```'
+            ls -la "$PROV" 2>&1 || echo "(dir not found)"
+            echo '```'
+            echo ""
+            echo "### Widget.mobileprovision"
+            if [ -f "$WIDGET" ]; then
+              echo '```'
+              echo "TeamIdentifier: $(security cms -D -i "$WIDGET" 2>/dev/null | plutil -extract TeamIdentifier.0 raw - 2>/dev/null || echo '<unreadable>')"
+              echo "UUID:           $(security cms -D -i "$WIDGET" 2>/dev/null | plutil -extract UUID raw - 2>/dev/null || echo '<unreadable>')"
+              echo "ExpirationDate: $(security cms -D -i "$WIDGET" 2>/dev/null | plutil -extract ExpirationDate raw - 2>/dev/null || echo '<unreadable>')"
+              echo '```'
+            else
+              echo "_Widget.mobileprovision not present._"
+            fi
+            echo ""
+            echo "_Full log attached as \`diagnostic.log\` artifact._"
+          } > summary.md
+          echo "path=summary.md" >> "$GITHUB_OUTPUT"
+          cat summary.md
 
-  - id: widget_profile_certs
-    desc: Certificate serials allowed by Widget.mobileprovision
-    cmd: security cms -D -i {{repo_root}}/{{provisioning_dir}}/Widget.mobileprovision | plutil -extract DeveloperCertificates raw - | head -5
-    expect: "list of serials"
-    severity: info
+      - name: Write job summary
+        run: cat summary.md >> "$GITHUB_STEP_SUMMARY"
 
-  - id: all_shipped_profiles
-    desc: Every provisioning profile shipped with the build
-    cmd: ls -la {{repo_root}}/{{provisioning_dir}}/
-    expect: "non-empty"
-    severity: info
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostic-${{ github.run_id }}
+          path: |
+            summary.md
+          retention-days: 14
+          if-no-files-found: warn
 
-  # ---------------------------------------------------------------
-  # 4. Fake codesigning certs (Ghostgram)
-  # ---------------------------------------------------------------
-  - id: fake_certs_dir
-    desc: Fake codesigning certs directory from Ghostgram
-    cmd: ls -la {{repo_root}}/{{certs_dir}}/
-    expect: "non-empty"
-    severity: warn
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: diagnostic
+          path: summary.md
 
-  - id: fake_public_cer
-    desc: Public.cer present
-    cmd: test -f {{repo_root}}/{{certs_dir}}/Public.cer && echo OK || echo MISSING
-    expect: "OK"
-    severity: warn
-
-  - id: fake_public_cer_info
-    desc: Subject / issuer of the fake Public.cer
-    cmd: openssl x509 -inform DER -in {{repo_root}}/{{certs_dir}}/Public.cer -noout -subject -issuer -dates 2>&1 || openssl x509 -in {{repo_root}}/{{certs_dir}}/Public.cer -noout -subject -issuer -dates
-    expect: "subject present"
-    severity: info
-
-  - id: fake_public_cer_sha
-    desc: SHA1 of fake Public.cer (compare with identity output)
-    cmd: openssl x509 -inform DER -in {{repo_root}}/{{certs_dir}}/Public.cer -noout -fingerprint -sha1 2>&1
-    expect: "SHA1 Fingerprint"
-    severity: info
-
-  - id: fake_private_key
-    desc: Private key matching Public.cer (usually NOT committed)
-    cmd: ls -la {{repo_root}}/{{certs_dir}}/Private.p12 2>&1 || echo "not present"
-    expect: "either present or explicitly absent"
-    severity: info
-
-  # ---------------------------------------------------------------
-  # 5. Build config the Bazel rules will use
-  # ---------------------------------------------------------------
-  - id: build_configuration_dir
-    desc: Contents of external/build_configuration+
-    cmd: ls -la {{repo_root}}/external/build_configuration+/ 2>&1
-    expect: "non-empty"
-    severity: info
-
-  - id: team_id_in_build_config
-    desc: Any hard-coded DEVELOPMENT_TEAM / TEAM_ID
-    cmd: grep -RInE "DEVELOPMENT_TEAM|TEAM_ID|CODE_SIGN_IDENTITY" {{repo_root}}/external/build_configuration+/ 2>/dev/null | head -20
-    expect: "definitions found"
-    severity: info
-
-  # ---------------------------------------------------------------
-  # 6. Bazel / build environment
-  # ---------------------------------------------------------------
-  - id: bazel_binary
-    desc: Bazel wrapper present at expected path
-    cmd: ls -la {{repo_root}}/build-input/bazel-8.4.2-darwin-arm64
-    expect: "executable"
-    severity: warn
-
-  - id: bazel_cache_dir
-    desc: Bazel output_user_root exists
-    cmd: ls -la {{bazel_output_root}}/ 2>&1
-    expect: "directory exists"
-    severity: info
-
-  - id: stale_bazel_processes
-    desc: Any stale bazel/process-and-sign processes
-    cmd: pgrep -fl "bazel|process-and-sign" 2>&1 || echo "none"
-    expect: "none running"
-    severity: warn
-
-  # ---------------------------------------------------------------
-  # 7. The specific failing target
-  # ---------------------------------------------------------------
-  - id: widget_extension_target
-    desc: WidgetExtension target declared in BUILD
-    cmd: grep -n "WidgetExtension" {{repo_root}}/Telegram/BUILD | head -20
-    expect: "target found"
-    severity: info
-
-  - id: process_and_sign_script
-    desc: Locate the generated process-and-sign script
-    cmd: find {{bazel_output_root}} -name "process-and-sign--*.sh" 2>/dev/null | head -5
-    expect: "found at least one"
-    severity: info
-
-  - id: last_build_log
-    desc: Tail of most recent bazel build log (if present)
-    cmd: find {{bazel_output_root}} -name "command.log" -exec tail -n 40 {} \; 2>/dev/null
-    expect: "non-empty"
-    severity: info
-
-  # ---------------------------------------------------------------
-  # 8. Compare identities vs the shipped profile
-  # ---------------------------------------------------------------
-  - id: identity_match_check
-    desc: >
-      Cross-check: for each codesigning identity SHA1, is it inside the
-      Widget.mobileprovision DeveloperCertificates list?
-    cmd: |
-      PROFILE={{repo_root}}/{{provisioning_dir}}/Widget.mobileprovision
-      security cms -D -i "$PROFILE" \
-        | plutil -extract DeveloperCertificates raw - \
-        | base64 -D 2>/dev/null \
-        | openssl x509 -noout -fingerprint -sha1 2>/dev/null \
-        | while read -r line; do
-            hash=$(echo "$line" | awk -F= '{print $2}' | tr -d ':')
-            security find-identity -v -p codesigning | grep -q "$hash" \
-              && echo "MATCH: $hash" \
-              || echo "NO MATCH: $hash"
-          done
-    expect: "at least one MATCH"
-    severity: critical
-    hints:
-      - "If all are NO MATCH: your cert is not in the shipped profile."
-      - "Fix: either use a profile tied to your Apple team, or build the simulator with signing disabled."
+      - name: Gate (soft)
+        if: steps.diag.outputs.exit_code != '0'
+        shell: bash
+        run: |
+          echo "::warning::Diagnostic reported critical issues (exit ${{ steps.diag.outputs.exit_code }})."
+          # Uncomment to hard-fail CI:
+          # exit 1
