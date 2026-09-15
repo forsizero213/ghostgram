@@ -1,4 +1,4 @@
-name: Debug Make.py Help
+name: Debug Telegram disableProvisioningProfiles
 
 on:
   workflow_dispatch:
@@ -28,42 +28,149 @@ jobs:
           sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
           xcodebuild -version
 
-      - name: Show Make.py build help
+      - name: Create canonical source directory
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
-          python3 build-system/Make/Make.py build --help 2>&1
+          sudo mkdir -p /Users/Shared
+          rm -rf /Users/Shared/telegram-ios
+          cp -R "$GITHUB_WORKSPACE" /Users/Shared/telegram-ios
 
-      - name: Show Make.py help (general)
+      - name: Setup Minimal Configuration
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
-          python3 build-system/Make/Make.py --help 2>&1
+          cd /Users/Shared/telegram-ios
+          cat << 'EOF' > build-system/appstore-configuration.json
+          {
+            "bundle_id": "ph.telegra.Telegraph",
+            "api_id": "34064276",
+            "api_hash": "79d1eeba6d4521f29a81dc40db4ec79a",
+            "team_id": "C67CF9S4VU",
+            "app_center_id": "0",
+            "is_internal_build": "false",
+            "is_appstore_build": "true",
+            "appstore_id": "0",
+            "app_specific_url_scheme": "tg",
+            "premium_iap_product_id": "",
+            "enable_siri": false,
+            "enable_icloud": false
+          }
+          EOF
 
-      - name: Inspect Make.py source for codesigning flags
+      - name: Pre-download Bazel Binary
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
-          echo "=== Grep for disable/skip/signing keywords ==="
-          grep -in "disable\|skip\|sign" build-system/Make/Make.py | head -50 || echo "No matches"
-
-      - name: Check appstore-configuration.json structure
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
-          if [ -f "build-system/appstore-configuration.json" ]; then
-            echo "=== Found existing config ==="
-            cat build-system/appstore-configuration.json | python3 -m json.tool
-          else
-            echo "No config file yet"
+          BAZEL_VERSION="8.4.2"
+          BAZEL_DIR="/tmp/bazel-bin-cache"
+          mkdir -p "$BAZEL_DIR"
+          if [ ! -f "$BAZEL_DIR/bazel" ]; then
+            echo "Downloading Bazel $BAZEL_VERSION..."
+            curl --retry 10 --retry-delay 5 --retry-max-time 120 --connect-timeout 15 \
+              -sSL "https://github.com/bazelbuild/bazel/releases/download/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-darwin-arm64" \
+              -o "$BAZEL_DIR/bazel"
+            chmod +x "$BAZEL_DIR/bazel"
           fi
+          echo "BAZEL_BIN=$BAZEL_DIR/bazel" >> "$GITHUB_ENV"
 
-      - name: List Build environment files
+      - name: Prepare build
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
-          echo "=== Build system structure ==="
-          find build-system/Make -type f -name "*.py" | head -20
-          echo ""
-          echo "=== Build system argument parsing ==="
-          grep -n "argparse\|add_argument" build-system/Make/Make.py | head -30 || true
+          cd /Users/Shared/telegram-ios
+
+          BUILD_NUMBER_OFFSET="$(cat build_number_offset)"
+          APP_VERSION=$(python3 -c '
+          import json
+          with open("versions.json") as f:
+              print(json.load(f)["app"])
+          ')
+
+          COMMIT_COUNT="$(git rev-list --count HEAD)"
+          BUILD_NUMBER="$((COMMIT_COUNT + BUILD_NUMBER_OFFSET))"
+
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+
+      - name: Test 1 - Verify flag is in BUILD file
+        run: |
+          set -euo pipefail
+          cd /Users/Shared/telegram-ios
+          
+          echo "=== Checking if disableProvisioningProfiles is defined in Telegram BUILD ==="
+          grep -n "disableProvisioningProfiles" Telegram/BUILD || echo "NOT FOUND in BUILD file"
+          
+          echo
+          echo "=== Checking Bazel config flags ==="
+          grep -rn "disableProvisioningProfiles" . --include="*.bazel" --include="*.bzl" 2>/dev/null | head -20 || echo "NOT FOUND in bazel files"
+
+      - name: Test 2 - Try build with --bazelArguments flag
+        run: |
+          set -euo pipefail
+
+          SOURCE_DIR=/Users/Shared/telegram-ios
+          BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
+
+          cd "$SOURCE_DIR"
+
+          echo "=== Attempting build with --bazelArguments flag ==="
+          python3 -u build-system/Make/Make.py \
+            --verbose \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --bazel="$BAZEL_BIN" \
+            --bazelArguments="--//Telegram:disableProvisioningProfiles" \
+            build \
+            --configurationPath="build-system/appstore-configuration.json" \
+            --codesigningInformationPath="build-system/fake-codesigning" \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER" \
+            2>&1 | head -100 || true
+        continue-on-error: true
+
+      - name: Test 3 - Check Make.py for how disableProvisioningProfiles is used
+        run: |
+          set -euo pipefail
+          cd /Users/Shared/telegram-ios
+          
+          echo "=== How Make.py uses disableProvisioningProfiles ==="
+          grep -B5 -A5 "disable_provisioning_profiles\|disableProvisioningProfiles" build-system/Make/Make.py | head -50
+
+      - name: Test 4 - Check if flag needs to be added to argument parser
+        run: |
+          set -euo pipefail
+          cd /Users/Shared/telegram-ios
+          
+          echo "=== Checking if --disableProvisioningProfiles is in argument parser ==="
+          grep -n "disableProvisioningProfiles" build-system/Make/Make.py | grep -i "add_argument\|argparse" || echo "NOT in argument parser"
+          
+          echo
+          echo "=== Full grep for disableProvisioningProfiles in Make.py ==="
+          grep -n "disableProvisioningProfiles" build-system/Make/Make.py
+
+      - name: Test 5 - Inspect BuildConfiguration.py
+        run: |
+          set -euo pipefail
+          cd /Users/Shared/telegram-ios
+          
+          echo "=== BuildConfiguration.py usage of disable_provisioning_profiles ==="
+          grep -B3 -A3 "disable_provisioning_profiles" build-system/Make/BuildConfiguration.py | head -60
+
+      - name: Test 6 - Try without the flag (fallback)
+        run: |
+          set -euo pipefail
+
+          SOURCE_DIR=/Users/Shared/telegram-ios
+          BAZEL_USER_ROOT="/private/var/tmp/_bazel_containerhost"
+
+          cd "$SOURCE_DIR"
+
+          echo "=== Attempting build WITHOUT disableProvisioningProfiles flag ==="
+          echo "This will likely fail with provisioning profile error, but shows the baseline"
+          python3 -u build-system/Make/Make.py \
+            --verbose \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --bazel="$BAZEL_BIN" \
+            build \
+            --configurationPath="build-system/appstore-configuration.json" \
+            --codesigningInformationPath="build-system/fake-codesigning" \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER" \
+            2>&1 | head -100 || true
+        continue-on-error: true
